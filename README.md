@@ -1,3 +1,12 @@
+> **BigBlueButton fork notice.** This repository is a fork of
+> [hasura/graphql-engine](https://github.com/hasura/graphql-engine) maintained by the
+> [BigBlueButton](https://bigbluebutton.org) project to build the community edition
+> `graphql-engine` server binary from source for the Ubuntu releases BigBlueButton targets,
+> with a small set of patches described in [BBB-CHANGES.md](./BBB-CHANGES.md). This fork is
+> not affiliated with, nor endorsed by, Hasura, Inc. "Hasura" is a trademark of Hasura, Inc.;
+> it is used here only to describe the origin of the code. The code remains licensed under
+> the Apache License 2.0 (see [LICENSE](./LICENSE)).
+
 ![Hasura logo](./assets/hasura_logo_primary_darkbg.png#gh-dark-mode-only)
 ![Hasura logo](./assets/hasura_logo_primary_lightbg.png#gh-light-mode-only)
 
