@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- registers the Prometheus metrics to a metric store so that GET /v1/metrics
+-- can export them. See BBB-CHANGES.md.
 module Main
   ( main,
   )
@@ -33,13 +36,14 @@ import Hasura.Server.App (CEConsoleType (OSSConsole))
 import Hasura.Server.Init
 import Hasura.Server.Metrics (ServerMetricsSpec, createServerMetrics)
 import Hasura.Server.Migrate (downgradeCatalog)
-import Hasura.Server.Prometheus (makeDummyPrometheusMetrics)
+import Hasura.Server.Prometheus (PrometheusMetricsSpec, makePrometheusMetrics)
 import Hasura.Server.Version
 import Hasura.ShutdownLatch
 import Hasura.Tracing (sampleAlways)
 import System.Environment (getEnvironment, lookupEnv, unsetEnv)
 import System.Exit qualified as Sys
 import System.Metrics qualified as EKG
+import System.Metrics.Prometheus qualified as Prometheus
 import System.Monitor.Heartbeat
 import System.Posix.Signals qualified as Signals
 
@@ -97,7 +101,8 @@ runApp env (HGEOptions rci metadataDbUrl hgeCmd) = do
 
         pure (EKG.subset EKG.emptyOf store, serverMetrics)
 
-      prometheusMetrics <- makeDummyPrometheusMetrics
+      promMetricsStore <- liftIO $ Prometheus.newStore @PrometheusMetricsSpec
+      prometheusMetrics <- liftIO $ makePrometheusMetrics promMetricsStore
 
       -- It'd be nice if we didn't have to call lowerManagedT twice here, but
       -- there is a data dependency problem since the call to runAppM below

@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret option (HASURA_GRAPHQL_METRICS_SECRET). See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
@@ -1791,5 +1793,5 @@ metricsSecretOption =
   Config.Option
     { Config._default = (),
       Config._envVar = "HASURA_GRAPHQL_METRICS_SECRET",
-      Config._helpMessage = "Secret key for accessing the metrics endpoint (if not set, metrics endpoint will be publicly accessible)"
+      Config._helpMessage = "Secret key for the metrics endpoint, sent as \"Authorization: Bearer <secret>\" (if not set, the metrics endpoint rejects every request with 401)"
     }

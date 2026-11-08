@@ -1,4 +1,6 @@
 cabal-version:       2.2
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the Hasura.Server.Prometheus.EkgExport module and test modules. See BBB-CHANGES.md.
 
 name:                graphql-engine
 version:             1.0.0
@@ -733,6 +735,7 @@ library
                      , Hasura.Server.API.Config
                      , Hasura.Server.Metrics
                      , Hasura.Server.Prometheus
+                     , Hasura.Server.Prometheus.EkgExport
                      , Hasura.Server.Telemetry
                      , Hasura.Server.Telemetry.Types
                      , Hasura.Server.Telemetry.Counters
@@ -1259,6 +1262,8 @@ test-suite graphql-engine-tests
     Hasura.Server.InitSpec
     Hasura.Server.Init.ArgSpec
     Hasura.Server.Migrate.VersionSpec
+    Hasura.Server.Prometheus.EkgExportSpec
+    Hasura.Server.PrometheusSpec
     Hasura.Server.RemoteSchemaHealingSpec
     Hasura.Server.TelemetrySpec
     Hasura.Server.VersionSpec

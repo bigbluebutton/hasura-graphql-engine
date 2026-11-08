@@ -1,5 +1,9 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds a metric specification and a store-backed constructor for the Prometheus
+-- metrics, used by the GET /v1/metrics endpoint. See BBB-CHANGES.md.
+
 -- | Mutable references for Prometheus metrics.
 --
 -- These metrics are independent from the metrics in "Hasura.Server.Metrics".
@@ -9,6 +13,8 @@ module Hasura.Server.Prometheus
     EventTriggerMetrics (..),
     CacheRequestMetrics (..),
     OpenTelemetryMetrics (..),
+    PrometheusMetricsSpec,
+    makePrometheusMetrics,
     makeDummyPrometheusMetrics,
     ConnectionsGauge,
     Connections (..),
@@ -38,7 +44,7 @@ module Hasura.Server.Prometheus
     liveQuerySubscriptionLabel,
     recordMetricWithLabel,
     recordSubscriptionMetric,
-    GraphQLRequestsLabels,
+    GraphQLRequestsLabels (..),
     recordGraphqlOperationMetric,
   )
 where
@@ -47,6 +53,9 @@ import Data.HashMap.Internal.Strict qualified as Map
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
+import Data.Kind (Type)
+import Data.Map.Strict qualified as OrdMap
+import GHC.TypeLits (Symbol)
 import Hasura.GraphQL.ParameterizedQueryHash
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
@@ -54,7 +63,22 @@ import Hasura.RQL.Types.Common (SourceName, sourceNameToText)
 import Hasura.RQL.Types.EventTrigger (TriggerName, triggerNameToTxt)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
-import System.Metrics.Prometheus (ToLabels (..))
+import System.Metrics.Prometheus
+  ( MetricType (..),
+    Sample,
+    SamplingGroup (..),
+    Store,
+    ToLabels (..),
+    createCounter,
+    createCounterVector,
+    createGauge,
+    createGaugeVector,
+    createHistogram,
+    createHistogramVector,
+    registerGroup,
+    registerPermanently,
+    sampleAll,
+  )
 import System.Metrics.Prometheus.Counter (Counter)
 import System.Metrics.Prometheus.Counter qualified as Counter
 import System.Metrics.Prometheus.CounterVector (CounterVector)
@@ -97,7 +121,12 @@ data PrometheusMetrics = PrometheusMetrics
     -- for subscriptions, tear down the operation) whenever this increments.
     pmWebsocketMsgDropped :: Counter,
     pmCacheRequestMetrics :: CacheRequestMetrics,
-    pmOpenTelemetryMetrics :: OpenTelemetryMetrics
+    pmOpenTelemetryMetrics :: OpenTelemetryMetrics,
+    -- | Sample every metric registered to the Prometheus metrics store.
+    -- 'makeDummyPrometheusMetrics' returns an empty sample; the sample of
+    -- 'makePrometheusMetrics' covers all the metrics above that are backed
+    -- by its store.
+    pmSample :: IO Sample
   }
 
 data GraphQLRequestMetrics = GraphQLRequestMetrics
@@ -182,6 +211,7 @@ makeDummyPrometheusMetrics = do
   pmWebsocketMsgDropped <- Counter.new
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
+  let pmSample = pure mempty
   pure PrometheusMetrics {..}
 
 makeDummyGraphQLRequestMetrics :: IO GraphQLRequestMetrics
@@ -506,3 +536,356 @@ recordGraphqlOperationMetric getMetricState operationType responseStatus operati
     True
     (metricAction promMetricGranularLabel)
     (metricAction promMetricLabel)
+
+--------------------------------------------------------------------------------
+-- Store-backed metrics (BigBlueButton)
+--
+-- The upstream community edition creates every mutable reference above with
+-- 'makeDummyPrometheusMetrics', without registering it to a metric store, so
+-- the values are updated but can never be sampled. The specification and
+-- constructor below register the same references to an
+-- "System.Metrics.Prometheus" store so that GET /v1/metrics can export them.
+-- The exported metric families, their labels and the histogram buckets are
+-- documented in BBB-CHANGES.md. Fields that are never incremented by
+-- community edition code (cache and OpenTelemetry metrics) are deliberately
+-- not registered.
+
+-- | Static specification of every metric registered by
+-- 'makePrometheusMetrics'.
+data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type where
+  HttpConnections ::
+    PrometheusMetricsSpec
+      "hasura_http_connections"
+      "Current number of active HTTP connections, excluding websocket connections"
+      'GaugeType
+      ()
+  WebsocketConnections ::
+    PrometheusMetricsSpec
+      "hasura_websocket_connections"
+      "Current number of active websocket connections"
+      'GaugeType
+      ()
+  GraphqlRequestsTotal ::
+    PrometheusMetricsSpec
+      "hasura_graphql_requests_total"
+      "Number of GraphQL requests received"
+      'CounterType
+      GraphQLRequestsLabels
+  GraphqlExecutionTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_graphql_execution_time_seconds"
+      "Execution time of successful GraphQL requests, in seconds"
+      'HistogramType
+      GraphQLOperationTypeLabel
+  EventTriggerHttpWorkers ::
+    PrometheusMetricsSpec
+      "hasura_event_trigger_http_workers"
+      "Current number of active event trigger HTTP workers"
+      'GaugeType
+      ()
+  EventsFetchQueryTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_events_fetch_query_time_seconds"
+      "Time taken to fetch a batch of events from the database, in seconds"
+      'HistogramType
+      EventsFetchQueryStatusLabel
+  EventsFetchedTotal ::
+    PrometheusMetricsSpec
+      "hasura_events_fetched_total"
+      "Number of events fetched from the database"
+      'CounterType
+      EventTriggerSourceLabel
+  EventsFetchedPerBatch ::
+    PrometheusMetricsSpec
+      "hasura_events_fetched_per_batch"
+      "Number of events fetched from the database in the last batch"
+      'GaugeType
+      ()
+  EventQueueTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_event_queue_time_seconds"
+      "Time an event spends waiting in the queue before being processed, in seconds"
+      'HistogramType
+      (Maybe DynamicEventTriggerLabel)
+  EventFetchTimePerBatchSeconds ::
+    PrometheusMetricsSpec
+      "hasura_event_fetch_time_per_batch_seconds"
+      "Time taken to fetch a batch of events, in seconds"
+      'HistogramType
+      ()
+  EventWebhookProcessingTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_event_webhook_processing_time_seconds"
+      "Time taken by the webhook to process an event, in seconds"
+      'HistogramType
+      (Maybe DynamicEventTriggerLabel)
+  EventProcessingTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_event_processing_time_seconds"
+      "Time taken to process an event end to end, in seconds"
+      'HistogramType
+      (Maybe DynamicEventTriggerLabel)
+  EventTriggerBytesReceivedTotal ::
+    PrometheusMetricsSpec
+      "hasura_event_trigger_bytes_received_total"
+      "Total number of bytes received in event trigger webhook responses"
+      'CounterType
+      ()
+  EventTriggerBytesSentTotal ::
+    PrometheusMetricsSpec
+      "hasura_event_trigger_bytes_sent_total"
+      "Total number of bytes sent in event trigger webhook requests"
+      'CounterType
+      ()
+  EventProcessedTotal ::
+    PrometheusMetricsSpec
+      "hasura_event_processed_total"
+      "Number of events processed"
+      'CounterType
+      EventStatusWithTriggerLabel
+  EventInvocationsTotal ::
+    PrometheusMetricsSpec
+      "hasura_event_invocations_total"
+      "Number of event webhook invocations"
+      'CounterType
+      EventStatusWithTriggerLabel
+  ScheduledTriggerBytesReceivedTotal ::
+    PrometheusMetricsSpec
+      "hasura_scheduled_trigger_bytes_received_total"
+      "Total number of bytes received in scheduled trigger webhook responses"
+      'CounterType
+      ()
+  ScheduledTriggerBytesSentTotal ::
+    PrometheusMetricsSpec
+      "hasura_scheduled_trigger_bytes_sent_total"
+      "Total number of bytes sent in scheduled trigger webhook requests"
+      'CounterType
+      ()
+  CronEventsInvocationTotal ::
+    PrometheusMetricsSpec
+      "hasura_cron_events_invocation_total"
+      "Number of cron event webhook invocations"
+      'CounterType
+      EventStatusLabel
+  OneOffEventsInvocationTotal ::
+    PrometheusMetricsSpec
+      "hasura_oneoff_events_invocation_total"
+      "Number of one-off scheduled event webhook invocations"
+      'CounterType
+      EventStatusLabel
+  CronEventsProcessedTotal ::
+    PrometheusMetricsSpec
+      "hasura_cron_events_processed_total"
+      "Number of cron events processed"
+      'CounterType
+      EventStatusLabel
+  OneOffEventsProcessedTotal ::
+    PrometheusMetricsSpec
+      "hasura_oneoff_events_processed_total"
+      "Number of one-off scheduled events processed"
+      'CounterType
+      EventStatusLabel
+  ActiveSubscriptionPollers ::
+    PrometheusMetricsSpec
+      "hasura_active_subscription_pollers"
+      "Current number of active subscription pollers"
+      'GaugeType
+      SubscriptionKindLabel
+  ActiveSubscriptionPollersInErrorState ::
+    PrometheusMetricsSpec
+      "hasura_active_subscription_pollers_in_error_state"
+      "Current number of active subscription pollers in error state"
+      'GaugeType
+      SubscriptionKindLabel
+  SubscriptionTotalTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_subscription_total_time_seconds"
+      "Time taken to complete a subscription poll cycle, in seconds"
+      'HistogramType
+      SubscriptionLabel
+  SubscriptionDbExecutionTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_subscription_db_execution_time_seconds"
+      "Time spent executing the subscription query in the database, in seconds"
+      'HistogramType
+      SubscriptionLabel
+  ActiveSubscriptions ::
+    PrometheusMetricsSpec
+      "hasura_active_subscriptions"
+      "Current number of active subscriptions"
+      'GaugeType
+      SubscriptionLabel
+  WebsocketMessagesReceivedBytesTotal ::
+    PrometheusMetricsSpec
+      "hasura_websocket_messages_received_bytes_total"
+      "Total number of bytes received in websocket messages"
+      'CounterType
+      ()
+  WebsocketMessagesSentBytesTotal ::
+    PrometheusMetricsSpec
+      "hasura_websocket_messages_sent_bytes_total"
+      "Total number of bytes sent in websocket messages"
+      'CounterType
+      DynamicGraphqlOperationLabel
+  ActionBytesReceivedTotal ::
+    PrometheusMetricsSpec
+      "hasura_action_bytes_received_total"
+      "Total number of bytes received in action webhook responses"
+      'CounterType
+      ()
+  ActionBytesSentTotal ::
+    PrometheusMetricsSpec
+      "hasura_action_bytes_sent_total"
+      "Total number of bytes sent in action webhook requests"
+      'CounterType
+      ()
+  WebsocketMessageQueueTime ::
+    PrometheusMetricsSpec
+      "hasura_websocket_message_queue_time"
+      "Time a message spends in the websocket send queue, in seconds"
+      'HistogramType
+      ()
+  WebsocketMessageWriteTime ::
+    PrometheusMetricsSpec
+      "hasura_websocket_message_write_time"
+      "Time taken to write a message to the websocket connection, in seconds"
+      'HistogramType
+      ()
+  WebsocketMessagesQueuedTotal ::
+    PrometheusMetricsSpec
+      "hasura_websocket_messages_queued_total"
+      "Total number of messages enqueued for sending over a websocket connection"
+      'CounterType
+      ()
+  WebsocketMessagesDroppedTotal ::
+    PrometheusMetricsSpec
+      "hasura_websocket_messages_dropped_total"
+      "Total number of messages dropped because the websocket send queue was full"
+      'CounterType
+      ()
+
+-- | Static @operation_type@ label for the GraphQL execution time histograms.
+data GraphQLOperationTypeLabel
+  = QueryOperationTypeLabel
+  | MutationOperationTypeLabel
+  deriving stock (Eq, Ord)
+
+instance ToLabels GraphQLOperationTypeLabel where
+  toLabels QueryOperationTypeLabel = HashMap.singleton "operation_type" "query"
+  toLabels MutationOperationTypeLabel = HashMap.singleton "operation_type" "mutation"
+
+-- | Create mutable references for all the metrics of 'PrometheusMetrics'
+-- and register them to the given store, so that they can be sampled (see
+-- 'pmSample'). This mirrors 'makeDummyPrometheusMetrics', which creates the
+-- same references without a store.
+--
+-- Can throw a 'System.Metrics.Prometheus.RegistrationError' exception if a
+-- metric name/label pair is registered twice; the specification above
+-- guarantees this does not happen.
+makePrometheusMetrics :: Store PrometheusMetricsSpec -> IO PrometheusMetrics
+makePrometheusMetrics store = do
+  pmConnections <- newConnectionsGauge
+  registerPermanently store
+    $ registerGroup
+      ( SamplingGroup
+          :> (HttpConnections, (), \c -> fromIntegral (connWarpThreads c - connWebsockets c))
+          :> (WebsocketConnections, (), fromIntegral . connWebsockets)
+      )
+      (readConnectionsGauge pmConnections)
+  pmGraphQLRequestMetrics <- makeGraphQLRequestMetrics store
+  pmEventTriggerMetrics <- makeEventTriggerMetrics store
+  pmWebSocketBytesReceived <- createCounter WebsocketMessagesReceivedBytesTotal () store
+  pmWebSocketBytesSent <- createCounterVector WebsocketMessagesSentBytesTotal store OrdMap.toList
+  pmActionBytesReceived <- createCounter ActionBytesReceivedTotal () store
+  pmActionBytesSent <- createCounter ActionBytesSentTotal () store
+  pmScheduledTriggerMetrics <- makeScheduledTriggerMetrics store
+  pmSubscriptionMetrics <- makeSubscriptionMetrics store
+  pmWebsocketMsgQueueTimeSeconds <- createHistogram websocketMessageTimeBuckets WebsocketMessageQueueTime () store
+  pmWebsocketMsgWriteTimeSeconds <- createHistogram websocketMessageTimeBuckets WebsocketMessageWriteTime () store
+  pmWebsocketMsgQueued <- createCounter WebsocketMessagesQueuedTotal () store
+  pmWebsocketMsgDropped <- createCounter WebsocketMessagesDroppedTotal () store
+  -- Cache and OpenTelemetry metrics are never incremented by community
+  -- edition code, so they are not registered to the store.
+  pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
+  pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
+  let pmSample = sampleAll store
+  pure PrometheusMetrics {..}
+
+makeGraphQLRequestMetrics :: Store PrometheusMetricsSpec -> IO GraphQLRequestMetrics
+makeGraphQLRequestMetrics store = do
+  gqlRequests <- createCounterVector GraphqlRequestsTotal store OrdMap.toList
+  gqlExecutionTimeSecondsQuery <-
+    createHistogram graphqlExecutionTimeBuckets GraphqlExecutionTimeSeconds QueryOperationTypeLabel store
+  gqlExecutionTimeSecondsMutation <-
+    createHistogram graphqlExecutionTimeBuckets GraphqlExecutionTimeSeconds MutationOperationTypeLabel store
+  pure GraphQLRequestMetrics {..}
+
+makeEventTriggerMetrics :: Store PrometheusMetricsSpec -> IO EventTriggerMetrics
+makeEventTriggerMetrics store = do
+  eventTriggerHTTPWorkers <- createGauge EventTriggerHttpWorkers () store
+  eventsFetchQueryTime <-
+    createHistogramVector eventsFetchQueryTimeBuckets EventsFetchQueryTimeSeconds store OrdMap.toList
+  eventsFetchedTotal <- createCounterVector EventsFetchedTotal store OrdMap.toList
+  eventsFetchedPerBatch <- createGauge EventsFetchedPerBatch () store
+  eventQueueTimeSeconds <-
+    createHistogramVector eventProcessingTimeBuckets EventQueueTimeSeconds store OrdMap.toList
+  eventsFetchTimePerBatch <-
+    createHistogram eventsFetchQueryTimeBuckets EventFetchTimePerBatchSeconds () store
+  eventWebhookProcessingTime <-
+    createHistogramVector eventWebhookProcessingTimeBuckets EventWebhookProcessingTimeSeconds store OrdMap.toList
+  eventProcessingTime <-
+    createHistogramVector eventProcessingTimeBuckets EventProcessingTimeSeconds store OrdMap.toList
+  eventTriggerBytesReceived <- createCounter EventTriggerBytesReceivedTotal () store
+  eventTriggerBytesSent <- createCounter EventTriggerBytesSentTotal () store
+  eventProcessedTotal <- createCounterVector EventProcessedTotal store OrdMap.toList
+  eventInvocationTotal <- createCounterVector EventInvocationsTotal store OrdMap.toList
+  pure EventTriggerMetrics {..}
+
+makeScheduledTriggerMetrics :: Store PrometheusMetricsSpec -> IO ScheduledTriggerMetrics
+makeScheduledTriggerMetrics store = do
+  stmScheduledTriggerBytesReceived <- createCounter ScheduledTriggerBytesReceivedTotal () store
+  stmScheduledTriggerBytesSent <- createCounter ScheduledTriggerBytesSentTotal () store
+  stmCronEventsInvocationTotalSuccess <- createCounter CronEventsInvocationTotal eventSuccessLabel store
+  stmCronEventsInvocationTotalFailure <- createCounter CronEventsInvocationTotal eventFailedLabel store
+  stmOneOffEventsInvocationTotalSuccess <- createCounter OneOffEventsInvocationTotal eventSuccessLabel store
+  stmOneOffEventsInvocationTotalFailure <- createCounter OneOffEventsInvocationTotal eventFailedLabel store
+  stmCronEventsProcessedTotalSuccess <- createCounter CronEventsProcessedTotal eventSuccessLabel store
+  stmCronEventsProcessedTotalFailure <- createCounter CronEventsProcessedTotal eventFailedLabel store
+  stmOneOffEventsProcessedTotalSuccess <- createCounter OneOffEventsProcessedTotal eventSuccessLabel store
+  stmOneOffEventsProcessedTotalFailure <- createCounter OneOffEventsProcessedTotal eventFailedLabel store
+  pure ScheduledTriggerMetrics {..}
+
+makeSubscriptionMetrics :: Store PrometheusMetricsSpec -> IO SubscriptionMetrics
+makeSubscriptionMetrics store = do
+  submActiveLiveQueryPollers <- createGauge ActiveSubscriptionPollers liveQuerySubscriptionLabel store
+  submActiveStreamingPollers <- createGauge ActiveSubscriptionPollers streamingSubscriptionLabel store
+  submActiveLiveQueryPollersInError <-
+    createGauge ActiveSubscriptionPollersInErrorState liveQuerySubscriptionLabel store
+  submActiveStreamingPollersInError <-
+    createGauge ActiveSubscriptionPollersInErrorState streamingSubscriptionLabel store
+  submTotalTime <-
+    createHistogramVector subscriptionTimeBuckets SubscriptionTotalTimeSeconds store OrdMap.toList
+  submDBExecTotalTime <-
+    createHistogramVector subscriptionTimeBuckets SubscriptionDbExecutionTimeSeconds store OrdMap.toList
+  submActiveSubscriptions <- createGaugeVector ActiveSubscriptions store OrdMap.toList
+  pure SubscriptionMetrics {..}
+
+-- Histogram buckets of the exported metric families (see BBB-CHANGES.md).
+
+graphqlExecutionTimeBuckets :: [Histogram.UpperBound]
+graphqlExecutionTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10]
+
+eventsFetchQueryTimeBuckets :: [Histogram.UpperBound]
+eventsFetchQueryTimeBuckets = [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
+
+eventProcessingTimeBuckets :: [Histogram.UpperBound]
+eventProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
+
+eventWebhookProcessingTimeBuckets :: [Histogram.UpperBound]
+eventWebhookProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10]
+
+subscriptionTimeBuckets :: [Histogram.UpperBound]
+subscriptionTimeBuckets = [0.000001, 0.0001, 0.01, 0.1, 0.3, 1, 3, 10, 30, 100]
+
+websocketMessageTimeBuckets :: [Histogram.UpperBound]
+websocketMessageTimeBuckets = [0.000001, 0.0001, 0.01, 0.1, 0.3, 1, 3, 10, 30, 100]
