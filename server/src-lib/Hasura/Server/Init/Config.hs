@@ -353,7 +353,8 @@ data ServeOptionsRaw impl = ServeOptionsRaw
     rsoServerTimeout :: Maybe (Refined NonNegative Int),
     rsoLogMaskedVariables :: Maybe (HashSet Text),
     rsoRelayMode :: RelayModeStatus,
-    rsoRemoteSchemaHealingInterval :: Maybe OptionalInterval
+    rsoRemoteSchemaHealingInterval :: Maybe OptionalInterval,
+    rsoMetricsSecret :: Maybe Auth.AdminSecretHash
   }
 
 deriving stock instance (Show (Logging.EngineLogType impl)) => Show (ServeOptionsRaw impl)
@@ -715,7 +716,8 @@ data ServeOptions impl = ServeOptions
     soServerTimeout :: Refined NonNegative Int,
     soLogMaskedVariables :: HashSet Text,
     soRelayMode :: RelayModeStatus,
-    soRemoteSchemaHealingInterval :: OptionalInterval
+    soRemoteSchemaHealingInterval :: OptionalInterval,
+    soMetricsSecret :: Maybe Auth.AdminSecretHash
   }
 
 -- | 'ResponseInternalErrorsConfig' represents the encoding of the

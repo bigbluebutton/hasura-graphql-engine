@@ -86,6 +86,7 @@ module Hasura.Server.Init.Arg.Command.Serve
     logMaskedVariablesOption,
     enableRelayOption,
     remoteSchemaHealingIntervalOption,
+    metricsSecretOption,
 
     -- * Pretty Printer
     serveCmdFooter,
@@ -199,6 +200,7 @@ serveCommandParser =
     <*> parseLogMaskedVariables
     <*> parseEnableRelay
     <*> parseRemoteSchemaHealingInterval
+    <*> parseMetricsSecret
 
 --------------------------------------------------------------------------------
 -- Serve Options
@@ -1769,6 +1771,25 @@ serveCmdFooter =
         Config.optionPP serverTimeoutOption,
         Config.optionPP logMaskedVariablesOption,
         Config.optionPP enableRelayOption,
-        Config.optionPP remoteSchemaHealingIntervalOption
+        Config.optionPP remoteSchemaHealingIntervalOption,
+        Config.optionPP metricsSecretOption
       ]
     eventEnvs = [Config.optionPP graphqlEventsHttpPoolSizeOption, Config.optionPP graphqlEventsFetchIntervalOption]
+
+parseMetricsSecret :: Opt.Parser (Maybe Auth.AdminSecretHash)
+parseMetricsSecret =
+  Opt.optional
+    $ Auth.hashAdminSecret
+    <$> Opt.strOption
+      ( Opt.long "metrics-secret"
+          <> Opt.metavar "METRICS SECRET KEY"
+          <> Opt.help (Config._helpMessage metricsSecretOption)
+      )
+
+metricsSecretOption :: Config.Option ()
+metricsSecretOption =
+  Config.Option
+    { Config._default = (),
+      Config._envVar = "HASURA_GRAPHQL_METRICS_SECRET",
+      Config._helpMessage = "Secret key for accessing the metrics endpoint (if not set, metrics endpoint will be publicly accessible)"
+    }
