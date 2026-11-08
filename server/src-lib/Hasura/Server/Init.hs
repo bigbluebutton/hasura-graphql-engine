@@ -247,6 +247,7 @@ mkServeOptions sor@ServeOptionsRaw {..} = do
   soLogMaskedVariables <- withOptionDefault rsoLogMaskedVariables logMaskedVariablesOption
   soRelayMode <- withOptionSwitch' rsoRelayMode (isRelayEnabled, bool RelayModeDisabled RelayModeEnabled) enableRelayOption
   soRemoteSchemaHealingInterval <- withOptionDefault rsoRemoteSchemaHealingInterval remoteSchemaHealingIntervalOption
+  soMetricsSecret <- withOption rsoMetricsSecret metricsSecretOption
   pure ServeOptions {..}
 
 -- | Fetch Postgres 'Query.ConnParams' components from the environment

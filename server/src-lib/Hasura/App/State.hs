@@ -181,7 +181,8 @@ data AppContext = AppContext
     acHeaderPrecedence :: HeaderPrecedence,
     acRedactActionHandlerLogs :: RedactActionHandlerLogsStatus,
     acTraceQueryStatus :: TraceQueryStatus,
-    acRelayMode :: RelayModeStatus
+    acRelayMode :: RelayModeStatus,
+    acMetricsSecret :: Maybe AdminSecretHash
   }
 
 -- | Collection of the LoggerCtx, the regular Logger and the PGLogger
@@ -312,7 +313,8 @@ buildAppContextRule = proc (ServeOptions {..}, env, _keys) -> do
           acHeaderPrecedence = soHeaderPrecedence,
           acRedactActionHandlerLogs = soRedactActionHandlerLogs,
           acTraceQueryStatus = soTraceQueryStatus,
-          acRelayMode = soRelayMode
+          acRelayMode = soRelayMode,
+          acMetricsSecret = soMetricsSecret
         }
   where
     buildEventEngineCtx = Inc.cache proc (httpPoolSize, fetchInterval, fetchBatchSize) -> do

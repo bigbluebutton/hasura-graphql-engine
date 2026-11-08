@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret default to the serve options. See BBB-CHANGES.md.
 {-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -347,6 +349,7 @@ serveOptions =
       soDisableNativeQueryValidation = Init._default Init.disableNativeQueryValidationOption,
       soPreserve401Errors = Init.MapEverythingTo200,
       soServerTimeout = Init._default Init.serverTimeoutOption,
+      soMetricsSecret = Nothing,
       soLogMaskedVariables = Set.empty,
       soRelayMode = Init.RelayModeEnabled,
       soRemoteSchemaHealingInterval = Init._default Init.remoteSchemaHealingIntervalOption
