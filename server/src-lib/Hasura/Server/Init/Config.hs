@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret to the serve options. See BBB-CHANGES.md.
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
 

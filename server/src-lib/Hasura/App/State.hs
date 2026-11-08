@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret to the app context. See BBB-CHANGES.md.
 {-# LANGUAGE Arrows #-}
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
 

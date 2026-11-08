@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret serve option. See BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 
 -- | Arg and Env Parsing for initialisation of the engine along with

@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds the metrics secret to the raw serve options. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 module Hasura.Server.InitSpec
