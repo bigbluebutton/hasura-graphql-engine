@@ -1,59 +1,143 @@
-name: Build v2
+name: Build v2 (BBB)
+
+# Builds the community edition graphql-engine binary from source for the two
+# Ubuntu LTS lines BigBlueButton targets, and publishes a GitHub release with
+# both binaries when a v*-bbb.* tag is pushed.
+#
+# The jammy build runs inside an ubuntu:22.04 container on an ubuntu-24.04
+# runner: the ubuntu-22.04 runner label is being retired by GitHub (removal
+# scheduled for 2027-04-17, actions/runner-images#14254).
 
 on:
   push:
-    branches:
-      - '*-bbb'
+    branches: ['v*-bbb']
+    tags: ['v*-bbb.*']
   pull_request:
-    branches:
-      - '*-bbb'
+    branches: ['v*-bbb']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHC_VERSION: 9.14.1
+  CABAL_VERSION: 3.16.1.0
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: jammy
+            # ubuntu:22.04
+            image: ubuntu@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+          - distro: noble
+            # ubuntu:24.04
+            image: ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
     runs-on: ubuntu-24.04
-
+    timeout-minutes: 180
+    container:
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Cache GHC and Cabal tools
-        uses: actions/cache@v4
+      - name: Cache ghcup and cabal store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.ghcup
-          key: ghcup-${{ runner.os }}-9.10.2
-          restore-keys: |
-            ghcup-${{ runner.os }}-
-
-      - name: Cache Cabal packages
-        uses: actions/cache@v4
-        with:
+          # dist-newstyle is deliberately not cached: two distros would blow
+          # past the 10 GB per-repository cache limit.
           path: |
-            ~/.cabal/store
-            ~/.cabal/packages
-          key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project.freeze', 'server/**/*.cabal') }}
+            ~/.ghcup
+            ~/.cache/cabal
+            ~/.local/state/cabal
+          key: hge-${{ matrix.distro }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('cabal.project', 'cabal.project.freeze') }}
           restore-keys: |
-            cabal-${{ runner.os }}-
+            hge-${{ matrix.distro }}-ghc${{ env.GHC_VERSION }}-
 
-      - name: Cache build artifacts
-        uses: actions/cache@v4
+      - name: Install toolchain (apt + ghcup)
+        run: ./scripts/build-v2.sh deps --ghc "$GHC_VERSION"
+
+      - name: Build graphql-engine
+        run: |
+          # HASURA_VERSION is always exported: the checkout inside the bare
+          # container has no .git directory (actions/checkout falls back to a
+          # REST download), so the script cannot derive a version itself.
+          # Release tags are v<upstream>-bbb.<N> but the binary reports
+          # v<upstream>-bbb<N> (server/CURRENT_VERSION), e.g. tag
+          # v2.50.7-bbb.1 -> version v2.50.7-bbb1. Other refs get a dev
+          # version derived from the commit.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            export HASURA_VERSION="${GITHUB_REF_NAME/-bbb./-bbb}"
+          else
+            export HASURA_VERSION="dev-${GITHUB_SHA::8}"
+          fi
+          ./scripts/build-v2.sh build --jobs 4
+
+      - name: Collect binary and build info
+        run: |
+          BIN=$(find dist-newstyle/build -type f -name graphql-engine -path '*/x/graphql-engine/*' | head -n1)
+          OUT=hasura-graphql-engine-${{ matrix.distro }}-amd64
+          cp "$BIN" "$OUT"
+          INFO=build-info-${{ matrix.distro }}.txt
+          {
+            echo "distro: ${{ matrix.distro }}"
+            echo "commit: $GITHUB_SHA"
+            echo "ref: $GITHUB_REF"
+            PATH="$HOME/.ghcup/bin:$PATH" ghc --version
+            PATH="$HOME/.ghcup/bin:$PATH" cabal --version
+            sha256sum cabal.project.freeze
+            sha256sum "$OUT"
+            echo "--- apt packages linked into the binary ---"
+            dpkg-query -W libc6 libgmp10 libpq5 libodbc2 libkrb5-3 || true
+            echo "--- ldd ---"
+            ldd "$OUT"
+          } | tee "$INFO"
+          ./"$OUT" version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          name: hasura-graphql-engine-${{ matrix.distro }}-amd64
           path: |
-            dist-newstyle
-            cabal/ci-nofreeze.project
-            cabal/ci-nofreeze.project.freeze
-          key: build-${{ runner.os }}-${{ hashFiles('cabal.project.freeze', 'server/**/*.hs', 'server/**/*.cabal') }}
-          restore-keys: |
-            build-${{ runner.os }}-
+            hasura-graphql-engine-${{ matrix.distro }}-amd64
+            build-info-${{ matrix.distro }}.txt
+          retention-days: 14
 
-      - name: Install dependencies
-        run: ./scripts/build-v2.sh deps
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Configure required reviewers on this environment in the repository
+    # settings to gate releases behind a manual approval.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
 
-      - name: Build
-        run: ./scripts/build-v2.sh build
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum hasura-graphql-engine-*-amd64 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
         env:
-          CABAL_JOBS: 4
-
-      - name: Upload graphql-engine binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: graphql-engine
-          path: dist-newstyle/build/x86_64-linux/ghc-9.10.2/graphql-engine-1.0.0/x/graphql-engine/opt/build/graphql-engine/graphql-engine
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Hasura GraphQL Engine CE ${GITHUB_REF_NAME%-bbb.*} built from source with BBB patches. One binary per distro: jammy (glibc 2.35, Ubuntu 22.04) and noble (glibc 2.39, Ubuntu 24.04). Verify downloads with SHA256SUMS." \
+            dist/hasura-graphql-engine-*-amd64 dist/SHA256SUMS dist/build-info-*.txt
