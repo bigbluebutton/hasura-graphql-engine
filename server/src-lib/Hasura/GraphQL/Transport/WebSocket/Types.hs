@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- the operation map entry carries a per-operation liveness flag used by the websocket
+-- transport (https://github.com/hasura/graphql-engine/issues/10952). See BBB-CHANGES.md.
 module Hasura.GraphQL.Transport.WebSocket.Types
   ( ErrRespType (ERTGraphqlCompliant, ERTLegacy),
     WSConn,
@@ -91,8 +94,10 @@ data SubscriberType
   = LiveQuerySubscriber !ES.SubscriberDetails
   | StreamingQuerySubscriber !ES.SubscriberDetails
 
+-- | The 'STM.TVar Bool' is the operation's liveness flag, created before the
+-- subscriber is handed to the poller and cleared in 'claimAndStopSubscription'.
 type OperationMap =
-  STMMap.Map OperationId (SubscriberType, Maybe OperationName)
+  STMMap.Map OperationId (SubscriberType, Maybe OperationName, STM.TVar Bool)
 
 type WSServer = WS.WSServer WSConnData
 
