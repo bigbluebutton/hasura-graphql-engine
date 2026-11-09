@@ -1,3 +1,7 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- guards subscription pushes with a per-operation liveness flag instead of an opMap lookup,
+-- so the first live query result is not dropped when the poller runs before the operation
+-- is registered (https://github.com/hasura/graphql-engine/issues/10952). See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | This file contains the handlers that are used within websocket server.
@@ -450,7 +454,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
   -- we process all operations on a websocket connection serially:
   when (isJust op)
     $ withComplete
-    $ sendStartErr granularPrometheusMetricsState (snd =<< op)
+    $ sendStartErr granularPrometheusMetricsState ((\(_, opName, _) -> opName) =<< op)
     $ "an operation already exists with this id: "
     <> unOperationId opId
 
@@ -1090,6 +1094,11 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
 
       for liveQueryE $ \((sourceName, E.SubscriptionQueryPlan exists), modelInfo) -> do
         let subscriberMetadata = ES.mkSubscriberMetadata (WS.getWSId wsConn) opId opName requestId
+        -- The operation's liveness flag must exist before 'addLiveQuery'
+        -- makes the subscriber visible to a poller: the first poll can push
+        -- before the 'opMap' insert below has happened, and 'onChange' must
+        -- not mistake that startup window for a torn-down operation.
+        opLive <- liftIO $ STM.newTVarIO True
         -- NOTE!: we mask async exceptions higher in the call stack, but it's
         -- crucial we don't lose lqId after addLiveQuery returns successfully.
         !lqId <- liftIO $ AB.dispatchAnyBackend @BackendTransport
@@ -1108,7 +1117,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
               requestId
               liveQueryPlan
               granularPrometheusMetricsState
-              (onChange granularPrometheusMetricsState opName parameterizedQueryHash $ ES._sqpNamespace liveQueryPlan)
+              (onChange opLive granularPrometheusMetricsState opName parameterizedQueryHash $ ES._sqpNamespace liveQueryPlan)
               modifier
               modelInfo
               modelInfoLogStatus
@@ -1117,12 +1126,15 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
         STM.atomically
           $
           -- NOTE: see crucial `lookup` check above, ensuring this doesn't clobber:
-          STMMap.insert (LiveQuerySubscriber lqId, opName) opId opMap
+          STMMap.insert (LiveQuerySubscriber lqId, opName, opLive) opId opMap
         pure lqId
 
     startStreamingQuery rootFieldName ((sourceName, E.SubscriptionQueryPlan exists), modelInfo) parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus = do
       let !opName = _grOperationName q
           subscriberMetadata = ES.mkSubscriberMetadata (WS.getWSId wsConn) opId opName requestId
+      -- See the matching note in 'startLiveQuery': the liveness flag must
+      -- exist before the subscriber is visible to a poller.
+      opLive <- liftIO $ STM.newTVarIO True
       -- NOTE!: we mask async exceptions higher in the call stack, but it's
       -- crucial we don't lose lqId after addLiveQuery returns successfully.
       streamSubscriberId <- liftIO $ AB.dispatchAnyBackend @BackendTransport
@@ -1142,7 +1154,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
             (_rfaAlias rootFieldName)
             streamQueryPlan
             granularPrometheusMetricsState
-            (onChange granularPrometheusMetricsState opName parameterizedQueryHash $ ES._sqpNamespace streamQueryPlan)
+            (onChange opLive granularPrometheusMetricsState opName parameterizedQueryHash $ ES._sqpNamespace streamQueryPlan)
             modifier
             modelInfo
             modelInfoLogStatus
@@ -1150,23 +1162,27 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
       STM.atomically
         $
         -- NOTE: see crucial `lookup` check above, ensuring this doesn't clobber:
-        STMMap.insert (StreamingQuerySubscriber streamSubscriberId, opName) opId opMap
+        STMMap.insert (StreamingQuerySubscriber streamSubscriberId, opName, opLive) opId opMap
       pure ()
 
     -- on change, send message on the websocket
     --
-    -- Guards against a dangling/straggler poll: 'removeLiveQuery'/
-    -- 'removeStreamingQuery' stop the poller and remove 'opId' from
-    -- 'opMap', but a poll that was already in-flight past its cohort
-    -- snapshot when that happened can still call this once afterward. If
-    -- 'opId' is no longer in 'opMap', the operation has already been
-    -- cancelled or completed, so this drops the push entirely instead of
-    -- risking a stray data message (or error+complete) arriving after the
-    -- client was already told the operation is done.
-    onChange :: IO GranularPrometheusMetricsState -> Maybe OperationName -> ParameterizedQueryHash -> Maybe Name -> ES.OnChange
-    onChange granularPrometheusMetricsState opName queryHash namespace response = do
-      stillLive <- STM.atomically $ STMMap.lookup opId opMap
-      when (isJust stillLive) $ case response of
+    -- Guards against a dangling/straggler poll: 'claimAndStopSubscription'
+    -- stops the poller, removes 'opId' from 'opMap' and sets the operation's
+    -- liveness flag to 'False' in that same transaction, but a poll that was
+    -- already in-flight past its cohort snapshot when that happened can
+    -- still call this once afterward. If the flag is 'False', the operation
+    -- has already been cancelled or completed, so this drops the push
+    -- entirely instead of risking a stray data message (or error+complete)
+    -- arriving after the client was already told the operation is done.
+    --
+    -- The flag, rather than an 'opMap' lookup, because the entry is only
+    -- inserted after 'addLiveQuery' returns and the first poll can push
+    -- before that.
+    onChange :: STM.TVar Bool -> IO GranularPrometheusMetricsState -> Maybe OperationName -> ParameterizedQueryHash -> Maybe Name -> ES.OnChange
+    onChange opLive granularPrometheusMetricsState opName queryHash namespace response = do
+      stillLive <- STM.readTVarIO opLive
+      when stillLive $ case response of
         Right (ES.SubscriptionResponse bs dTime resumeCursor) ->
           sendMsgWithMetadata
             True
@@ -1416,9 +1432,13 @@ claimAndStopSubscription ::
 claimAndStopSubscription logger serverMetrics prometheusMetrics subscriptionsState wsConn granularPrometheusMetricsState opId = do
   opM <- STM.atomically $ do
     m <- STMMap.lookup opId opMap
-    for_ m $ \_ -> STMMap.delete opId opMap
+    for_ m $ \(_, _, opLive) -> do
+      -- Atomically with the removal, so an in-flight poll's 'onChange' either
+      -- sees the operation live (and the entry still present) or neither.
+      STM.writeTVar opLive False
+      STMMap.delete opId opMap
     pure m
-  for_ opM $ \(subscriberDetails, operationName) -> do
+  for_ opM $ \(subscriberDetails, operationName, _) -> do
     logWSEvent logger wsConn $ EOperation $ OperationDetails opId Nothing operationName ODStopped Nothing Nothing
     case subscriberDetails of
       LiveQuerySubscriber lqId -> ES.removeLiveQuery logger serverMetrics prometheusMetrics subscriptionsState lqId granularPrometheusMetricsState operationName

@@ -76,6 +76,18 @@ Exported metric families (names, labels, buckets) are defined in `PrometheusMetr
 (`server/src-lib/Hasura/Server/Prometheus.hs`) and pinned by the golden test
 `server/src-test/Hasura/Server/PrometheusSpec.hs`.
 
+## Live query first-result race (upstream issue hasura/graphql-engine#10952)
+
+Since upstream v2.50.4, `onChange` in `Hasura.GraphQL.Transport.WebSocket` drops any
+push whose operation id is not in the connection's operation map, and the operation is
+only inserted into that map after `addLiveQuery` returns. When the poller runs in that
+window (a CPU-starved host makes it likely), the subscription's first result is
+discarded, and `pushResultToCohort` then treats the subscriber as already served, so
+nothing is sent until the result actually changes. The fix replaces the map lookup
+with a per-operation liveness flag (`STM.TVar Bool`) created before `addLiveQuery`
+and cleared in the same STM transaction that removes the operation from the map, so
+the startup window delivers and a straggler poll after teardown is still dropped.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -103,5 +115,8 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-test/Hasura/Server/Prometheus/EkgExportSpec.hs` (new file): tests name
   uniqueness and the name grammar of the EKG conversion.
 - `server/graphql-engine.cabal`: registers the new modules.
+- `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
+  `server/src-lib/Hasura/GraphQL/Transport/WebSocket/Types.hs`: per-operation liveness
+  flag for subscription pushes (see "Live query first-result race" above).
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
