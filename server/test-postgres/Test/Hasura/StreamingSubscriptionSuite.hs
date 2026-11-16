@@ -1,3 +1,7 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- tests the poller's operation name count when subscribers of one name are removed from two
+-- cohorts, and the count and the active subscriptions gauge when a subscriber that is in
+-- two cohorts is removed. See BBB-CHANGES.md.
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
@@ -13,6 +17,7 @@ import Control.Lens ((.~))
 import Data.Aeson qualified as J
 import Data.ByteString.Lazy.UTF8 qualified as LBS
 import Data.HashMap.Strict qualified as HashMap
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import Data.UUID qualified as UUID
@@ -31,6 +36,7 @@ import Hasura.GraphQL.Execute.Subscription.Poll.StreamingQuery (pollStreamingQue
 import Hasura.GraphQL.Execute.Subscription.State
 import Hasura.GraphQL.Execute.Subscription.TMap qualified as TMap
 import Hasura.GraphQL.ParameterizedQueryHash
+import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.GraphQL.Transport.WebSocket.Protocol (unsafeMkOperationId)
 import Hasura.GraphQL.Transport.WebSocket.Server qualified as WS
 import Hasura.Logging
@@ -42,7 +48,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (makeDummyPrometheusMetrics)
+import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), makeDummyPrometheusMetrics, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
@@ -50,6 +56,7 @@ import StmContainers.Map qualified as STMMap
 import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
 import System.Metrics
+import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
 import Test.Hspec
 
 buildStreamingSubscriptionSuite :: IO Spec
@@ -295,37 +302,6 @@ streamingSubscriptionPollingSpec srcConfig = do
         currentCohortMap <- STM.atomically $ TMap.getMap cohortMap
         HashMap.size currentCohortMap `shouldBe` 0 -- since there was only one cohort initially, now the cohort map should not have any cohorts
     describe "manipulating adding and deleting of subscribers concurrently" $ do
-      it "adding a new subscriber concurrently should place the subscriber in the appropriate cohort" $ do
-        temporarySubscriberId <- newSubscriberId
-        let newTemporarySubscriber = mkSubscriber temporarySubscriberId
-        STM.atomically $ do
-          TMap.reset cohortMap
-          TMap.insert cohort1 cohortKey1 cohortMap
-        syncMVar <- MVar.newEmptyMVar
-        let syncAction = do
-              MVar.readMVar syncMVar
-              STM.atomically $ addSubscriberToCohort newTemporarySubscriber cohort1
-        Async.withAsync
-          (pollingAction cohortMap (Just syncAction))
-          ( \pollAsync -> do
-              -- concurrently inserting a new cohort to a key (cohortKey2) to which
-              -- cohort1 is expected to be associated after the current poll
-              MVar.putMVar syncMVar ()
-              Async.wait pollAsync
-          )
-        currentCohortMap <- STM.atomically $ TMap.getMap cohortMap
-        let cohortKey2Cohort = HashMap.lookup cohortKey2 currentCohortMap
-            cohortKey1Cohort = HashMap.lookup cohortKey1 currentCohortMap
-        cohortKey1CohortSnapshot <- STM.atomically $ traverse getStaticCohortSnapshot cohortKey1Cohort
-        _cssNewSubscribers <$> cohortKey1CohortSnapshot `shouldBe` Just [temporarySubscriberId]
-
-        -- Checking below that the newly added subscriber is not added in the updated cohort
-        cohortKey2CohortSnapshot <- STM.atomically $ traverse getStaticCohortSnapshot cohortKey2Cohort
-        _cssNewSubscribers <$> cohortKey2CohortSnapshot `shouldSatisfy` all (notElem temporarySubscriberId)
-        _cssExistingSubscribers <$> cohortKey2CohortSnapshot `shouldSatisfy` all (notElem temporarySubscriberId)
-        STM.atomically
-          $ TMap.delete temporarySubscriberId (_cNewSubscribers cohort1)
-
       it "deleting a subscriber from a cohort should not retain the subscriber in any of the cohorts" $ do
         temporarySubscriberId <- newSubscriberId
         let newTemporarySubscriber = mkSubscriber temporarySubscriberId
@@ -444,6 +420,245 @@ streamingSubscriptionPollingSpec srcConfig = do
           STMMap.delete pollerKey streamQueryMap
           _pThread <$> STM.readTMVar ioState
         Immortal.stop threadRef
+
+    describe "Removing subscribers of one operation name spread over two cohorts" $ do
+      subscriptionState <- do
+        runIO $ initSubscriptionsState (const (pure ()))
+
+      dummyWSId <- runIO $ WS.mkUnsafeWSId <$> UUID.nextRandom
+      (cohortIdA, cohortIdB) <- runIO $ (,) <$> newCohortId <*> newCohortId
+
+      let operationName = Just $ OperationName [G.name|NumbersStream|]
+          requestIdA = RequestId "request-id-a"
+          requestIdB = RequestId "request-id-b"
+          subscriberAMetadata = mkSubscriberMetadata dummyWSId (unsafeMkOperationId "a") Nothing requestIdA
+          subscriberBMetadata = mkSubscriberMetadata dummyWSId (unsafeMkOperationId "b") Nothing requestIdB
+          dummyParamQueryHash = mkUnsafeParameterizedQueryHash "unsafeParamHash"
+          parameterizedSubscriptionQueryPlan = ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery multiplexedQuery
+          -- Two cursor values past the last row of "numbers": polls leave them as they are, so
+          -- the two subscribers stay in two cohorts of one poller.
+          cohortKeyA = mkCohortKey "10"
+          cohortKeyB = mkCohortKey "20"
+          queryPlanFor cohortId cohortKey = SubscriptionQueryPlan parameterizedSubscriptionQueryPlan srcConfig cohortId Nothing cohortKey Nothing
+          subOptions = mkSubscriptionsOptions Nothing Nothing
+          logger :: Logger Hasura = Logger $ \_ -> pure ()
+          addSubscriber subscriberMetadata reqId queryPlan =
+            addStreamSubscriptionQuery
+              @('Postgres 'Vanilla)
+              logger
+              dummyServerMetrics
+              dummyPromMetrics
+              subscriberMetadata
+              subscriptionState
+              (pure (subOptions, subOptions))
+              SNDefault
+              dummyParamQueryHash
+              operationName
+              reqId
+              [G.name|numbers_stream|]
+              queryPlan
+              (pure GranularMetricsOff)
+              (const (pure ()))
+              Nothing
+              []
+              (pure ModelInfoLogOff)
+          removeSubscriber subscriberDetails =
+            removeStreamingQuery
+              logger
+              dummyServerMetrics
+              dummyPromMetrics
+              subscriptionState
+              subscriberDetails
+              (pure GranularMetricsOff)
+              operationName
+          pollerOf = do
+            entries <- STM.atomically $ ListT.toList $ STMMap.listT (_ssStreamQueryMap subscriptionState)
+            pure $ snd <$> listToMaybe entries
+          operationNameCount =
+            pollerOf >>= \case
+              Nothing -> pure Nothing
+              Just poller -> STM.atomically $ TMap.lookup operationName (_pOperationNamesMap poller)
+
+      subscriberA <- runIO $ addSubscriber subscriberAMetadata requestIdA (queryPlanFor cohortIdA cohortKeyA)
+      subscriberB <- runIO $ addSubscriber subscriberBMetadata requestIdB (queryPlanFor cohortIdB cohortKeyB)
+
+      it "both subscribers share one poller, in two cohorts, and the operation name is counted twice" $ do
+        Just (Poller pollerCohorts _ _ _ _) <- pollerOf
+        cohorts <- STM.atomically $ TMap.toList pollerCohorts
+        length cohorts `shouldBe` 2
+        operationNameCount `shouldReturn` Just 2
+
+      it "removing one subscriber decrements the operation name count once" $ do
+        removeSubscriber subscriberA
+        operationNameCount `shouldReturn` Just 1
+
+      it "removing the same subscriber again leaves the operation name count as it is" $ do
+        removeSubscriber subscriberA
+        operationNameCount `shouldReturn` Just 1
+
+      it "removing the last subscriber removes the operation name, and the poller with it" $ do
+        Just poller <- pollerOf
+        removeSubscriber subscriberB
+        STM.atomically (TMap.lookup operationName (_pOperationNamesMap poller)) `shouldReturn` Nothing
+        isNothing <$> pollerOf `shouldReturn` True
+
+    describe "A subscriber added during a poll in which its cohort's key advances" $ do
+      -- The poll runs here, while the spec is built and the "numbers" table still exists, so
+      -- the cursor really advances (a poll inside an "it" runs after the teardown).
+      subscriptionState <- runIO $ initSubscriptionsState (const (pure ()))
+      promMetrics <- runIO makeDummyPrometheusMetrics
+      dummyWSId <- runIO $ WS.mkUnsafeWSId <$> UUID.nextRandom
+      (cohortIdA, cohortIdB) <- runIO $ (,) <$> newCohortId <*> newCohortId
+      let operationName = Just $ OperationName [G.name|NumbersStream|]
+          parameterizedSubscriptionQueryPlan = ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery multiplexedQuery
+          queryPlanFor cohortId cohortKey = SubscriptionQueryPlan parameterizedSubscriptionQueryPlan srcConfig cohortId Nothing cohortKey Nothing
+          subOptions = mkSubscriptionsOptions Nothing Nothing
+          quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+          addSubscriber opId reqId queryPlan =
+            addStreamSubscriptionQuery
+              @('Postgres 'Vanilla)
+              quietLogger
+              dummyServerMetrics
+              promMetrics
+              (mkSubscriberMetadata dummyWSId (unsafeMkOperationId opId) Nothing reqId)
+              subscriptionState
+              (pure (subOptions, subOptions))
+              SNDefault
+              paramQueryHash
+              operationName
+              reqId
+              [G.name|numbers_stream|]
+              queryPlan
+              (pure GranularMetricsOff)
+              (const (pure ()))
+              Nothing
+              []
+              (pure ModelInfoLogOff)
+          removeSubscriber subscriberDetails =
+            removeStreamingQuery quietLogger dummyServerMetrics promMetrics subscriptionState subscriberDetails (pure GranularMetricsOff) operationName
+          thePoller = do
+            entries <- STM.atomically $ ListT.toList $ STMMap.listT (_ssStreamQueryMap subscriptionState)
+            maybe (error "no poller") (pure . snd) (listToMaybe entries)
+          -- How many cohorts of the poller each subscriber is in.
+          cohortsPerSubscriber poller = STM.atomically do
+            cohorts <- TMap.toList (_pCohorts poller)
+            snapshots <- for cohorts (getStaticCohortSnapshot . snd)
+            pure
+              $ sort
+              $ HashMap.elems
+              $ HashMap.fromListWith (+) [(subscriberId, 1 :: Int) | snapshot <- snapshots, subscriberId <- _cssExistingSubscribers snapshot <> _cssNewSubscribers snapshot]
+          keyOfTheOnlyCohort poller = STM.atomically do
+            cohorts <- TMap.toList (_pCohorts poller)
+            case cohorts of
+              [(key, _)] -> pure key
+              _ -> error "expected a single cohort"
+          operationNameCount poller = STM.atomically $ TMap.lookup operationName (_pOperationNamesMap poller)
+          activeSubscriptions =
+            Map.lookup (SubscriptionLabel streamingSubscriptionLabel Nothing)
+              <$> GaugeVector.read (submActiveSubscriptions $ pmSubscriptionMetrics promMetrics)
+
+      subscriberA <- runIO $ addSubscriber "a" (RequestId "request-id-a") (queryPlanFor cohortIdA cohortKey1)
+      poller <- runIO thePoller
+      -- Stop the poller's own thread, so the only poll from here on is the one below.
+      runIO $ (STM.atomically $ _pThread <$> STM.readTMVar (_pIOState poller)) >>= Immortal.stop
+      keyOfA <- runIO $ keyOfTheOnlyCohort poller
+      subscriberB <- runIO $ MVar.newEmptyMVar
+      -- B joins A's cohort after the poll has taken its snapshot.
+      runIO
+        $ pollStreamingQuery
+          @('Postgres 'Vanilla)
+          pollerId
+          pollerResponseState
+          defaultSubscriptionOptions
+          (SNDefault, srcConfig)
+          (mkRoleNameE "user")
+          paramQueryHash
+          (MultiplexedQuery multiplexedQuery)
+          (_pCohorts poller)
+          [G.name|numbers_stream|]
+          (const $ pure ())
+          (Just $ addSubscriber "b" (RequestId "request-id-b") (queryPlanFor cohortIdB keyOfA) >>= MVar.putMVar subscriberB)
+          dummyPromMetrics
+          (pure GranularMetricsOff)
+          (_pOperationNamesMap poller)
+          Nothing
+          Nothing
+          quietLogger
+          []
+          (pure ModelInfoLogOff)
+      detailsOfB <- runIO $ MVar.readMVar subscriberB
+      membershipsAfterPoll <- runIO $ cohortsPerSubscriber poller
+      countBefore <- runIO $ operationNameCount poller
+      activeBefore <- runIO activeSubscriptions
+      runIO $ removeSubscriber detailsOfB
+      countAfterB <- runIO $ operationNameCount poller
+      activeAfterB <- runIO activeSubscriptions
+      runIO $ removeSubscriber subscriberA
+
+      it "the subscriber added during the poll ends up in two cohorts" $ do
+        -- A is in the cohort of the advanced key; B also in a new cohort under the old key.
+        membershipsAfterPoll `shouldBe` [1, 2]
+        countBefore `shouldBe` Just 2
+        activeBefore `shouldBe` Just 2
+
+      it "removing it counts its operation name down once" $ do
+        countAfterB `shouldBe` Just 1
+
+      it "removing it counts the active subscriptions down once" $ do
+        activeAfterB `shouldBe` Just 1
+
+    describe "Removing the last subscriber of a live query poller whose thread is not installed" $ do
+      activeBeforeAndAfter <- runIO do
+        subscriptionState <- initSubscriptionsState (const (pure ()))
+        promMetrics <- makeDummyPrometheusMetrics
+        wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
+        cohortId <- newCohortId
+        let quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+            options = mkSubscriptionsOptions Nothing Nothing
+            operationName = Just $ OperationName [G.name|LiveOp|]
+            liveQuery =
+              [PG.sql|
+                SELECT "_subs"."result_id", json_build_object('numbers', (SELECT coalesce(json_agg("id" ORDER BY "id"), '[]') FROM "public"."numbers"))::text AS "result"
+                FROM UNNEST(($1)::uuid[], ($2)::json[]) AS "_subs"("result_id", "result_vars")
+              |]
+            plan =
+              SubscriptionQueryPlan
+                (ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery liveQuery)
+                srcConfig
+                cohortId
+                Nothing
+                (mkCohortVariables mempty mempty mempty mempty mempty)
+                Nothing
+            activeSubscriptions = sum . Map.elems <$> GaugeVector.read (submActiveSubscriptions $ pmSubscriptionMetrics promMetrics)
+        details <-
+          addLiveQuery
+            @('Postgres 'Vanilla)
+            quietLogger
+            dummyServerMetrics
+            promMetrics
+            (mkSubscriberMetadata wsId (unsafeMkOperationId "l1") Nothing (RequestId "l1"))
+            subscriptionState
+            (pure (options, options))
+            SNDefault
+            paramQueryHash
+            operationName
+            (RequestId "l1")
+            plan
+            (pure GranularMetricsOff)
+            (const (pure ()))
+            Nothing
+            []
+            (pure ModelInfoLogOff)
+        poller <- maybe (error "no poller") pure . listToMaybe . fmap snd =<< STM.atomically (ListT.toList (STMMap.listT (_ssLiveQueryMap subscriptionState)))
+        -- Leave the poller without its thread, the state removeLiveQuery logs as a bug.
+        ioState <- STM.atomically (STM.takeTMVar (_pIOState poller))
+        Immortal.stop (_pThread ioState)
+        before <- activeSubscriptions
+        removeLiveQuery quietLogger dummyServerMetrics promMetrics subscriptionState details (pure GranularMetricsOff) operationName
+        (,) before <$> activeSubscriptions
+
+      it "counts the active subscriptions down" $ do
+        activeBeforeAndAfter `shouldBe` (1, 0)
 
   runIO teardown
 

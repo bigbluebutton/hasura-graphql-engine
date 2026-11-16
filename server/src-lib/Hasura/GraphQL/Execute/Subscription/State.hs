@@ -1,3 +1,7 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- removeStreamingQuery decrements the poller's operation name count and the active
+-- subscriptions gauge once per removed subscriber instead of once per cohort. See
+-- BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | Top-level management of subscription poller threads.
@@ -491,12 +495,18 @@ removeLiveQuery logger serverMetrics prometheusMetrics lqState lqId@(SubscriberD
                     (GaugeVector.dec numSubscriptionMetric promMetricLabel)
               -- This would seem to imply addLiveQuery broke or a bug
               -- elsewhere. Be paranoid and log:
-              Nothing ->
+              Nothing -> do
                 L.unLogger logger
                   $ L.UnstructuredLog L.LevelError
                   $ fromString
                   $ "In removeLiveQuery no worker thread installed. Please report this as a bug: "
                   <> show lqId
+                let numSubscriptionMetric = submActiveSubscriptions $ pmSubscriptionMetrics $ prometheusMetrics
+                recordMetricWithLabel
+                  granularPrometheusMetricsState
+                  True
+                  (GaugeVector.dec numSubscriptionMetric promMetricGranularLabel)
+                  (GaugeVector.dec numSubscriptionMetric promMetricLabel)
         else do
           let numSubscriptionMetric = submActiveSubscriptions $ pmSubscriptionMetrics $ prometheusMetrics
           return
@@ -528,8 +538,13 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
         case detM of
           Nothing -> return (pure False)
           Just (Poller cohorts pollerState ioState parameterizedQueryHash operationNamesMap, allCohorts) -> do
-            actions <- for allCohorts \cohort -> do
-              TMap.lookup maybeOperationName operationNamesMap >>= \case
+            -- A subscriber that joined while its cohort's key advanced can be in two cohorts
+            -- until they merge again (see the cohort map rebuild in pollStreamingQuery); its
+            -- operation name is counted down once if it is in any of them.
+            subscriberInPoller <- or <$> for allCohorts (isSubscriberOf sinkId)
+            when subscriberInPoller
+              $ TMap.lookup maybeOperationName operationNamesMap
+              >>= \case
                 -- If only one operation name is present in the map, delete it
                 Just 1 -> TMap.delete maybeOperationName operationNamesMap
                 -- If the count of a operation name is more than 1, then it means there
@@ -539,13 +554,31 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
                 Just _ -> TMap.adjust (\v -> v - 1) maybeOperationName operationNamesMap
                 Nothing -> return ()
 
-              cleanHandlerC cohorts pollerState ioState cohort parameterizedQueryHash
-            pure (mconcat actions >> pure True)
+            actions <- for allCohorts \cohort ->
+              cleanHandlerC cohorts pollerState ioState cohort
+            -- Counted down here rather than per cohort, for the same reason.
+            let numSubscriptionMetric = submActiveSubscriptions $ pmSubscriptionMetrics prometheusMetrics
+                promMetricGranularLabel = SubscriptionLabel streamingSubscriptionLabel (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) maybeOperationName)
+                promMetricLabel = SubscriptionLabel streamingSubscriptionLabel Nothing
+                countActiveDown =
+                  when subscriberInPoller
+                    $ recordMetricWithLabel
+                      granularPrometheusMetricsState
+                      True
+                      (GaugeVector.dec numSubscriptionMetric promMetricGranularLabel)
+                      (GaugeVector.dec numSubscriptionMetric promMetricLabel)
+            pure (mconcat actions >> countActiveDown >> pure True)
   when subscriberFound $ liftIO $ do
     EKG.Gauge.dec $ smActiveSubscriptions serverMetrics
     EKG.Gauge.dec $ smActiveStreamingSubscriptions serverMetrics
   where
     streamQMap = _ssStreamQueryMap subscriptionState
+
+    isSubscriberOf :: SubscriberId -> Cohort streamCursor -> STM.STM Bool
+    isSubscriberOf subscriberId cohort =
+      (||)
+        <$> (isJust <$> TMap.lookup subscriberId (_cExistingSubscribers cohort))
+        <*> (isJust <$> TMap.lookup subscriberId (_cNewSubscribers cohort))
 
     getQueryDet :: STMMap.Map BackendPollerKey (Poller streamCursor) -> STM.STM (Maybe (Poller streamCursor, [Cohort streamCursor]))
     getQueryDet subMap =
@@ -558,16 +591,8 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
       STM.TVar PollerResponseState ->
       STM.TMVar PollerIOState ->
       Cohort (STM.TVar CursorVariableValues) ->
-      ParameterizedQueryHash ->
       STM.STM (IO ())
-    cleanHandlerC cohortMap pollerState ioState cohort parameterizedQueryHash = do
-      -- In certain cases the sinkId is not to be found, in which case we want
-      -- to avoid decrementing the subscribers metric. TODO understand this better
-      deletedSomething <- do
-        -- just below...
-        deletedExisting <- isJust <$> TMap.lookup sinkId (_cExistingSubscribers cohort)
-        deletedNew <- isJust <$> TMap.lookup sinkId (_cNewSubscribers cohort)
-        pure (deletedExisting || deletedNew)
+    cleanHandlerC cohortMap pollerState ioState cohort = do
       TMap.delete sinkId (_cExistingSubscribers cohort)
       TMap.delete sinkId (_cNewSubscribers cohort)
 
@@ -593,8 +618,6 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
           Nothing -> pure ()
 
       handlerIsEmpty <- TMap.null cohortMap
-      let promMetricGranularLabel = SubscriptionLabel streamingSubscriptionLabel (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) maybeOperationName)
-          promMetricLabel = SubscriptionLabel streamingSubscriptionLabel Nothing
       -- when there is no need for handler i.e,
       -- operation, take the ref for the polling thread to cancel it
       if handlerIsEmpty
@@ -614,13 +637,6 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
                     $ submActiveStreamingPollersInError
                     $ pmSubscriptionMetrics prometheusMetrics
                   Prometheus.Gauge.dec $ submActiveStreamingPollers $ pmSubscriptionMetrics prometheusMetrics
-                  let numSubscriptionMetric = submActiveSubscriptions $ pmSubscriptionMetrics $ prometheusMetrics
-                  when deletedSomething
-                    $ recordMetricWithLabel
-                      granularPrometheusMetricsState
-                      True
-                      (GaugeVector.dec numSubscriptionMetric promMetricGranularLabel)
-                      (GaugeVector.dec numSubscriptionMetric promMetricLabel)
               -- This would seem to imply addStreamSubscriptionQuery broke or a bug
               -- elsewhere. Be paranoid and log:
               Nothing ->
@@ -632,15 +648,7 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
                   <> show handlerId
                   <> ", subscriber_id:"
                   <> show sinkId
-        else do
-          let numSubscriptionMetric = submActiveSubscriptions $ pmSubscriptionMetrics $ prometheusMetrics
-          return
-            $ when deletedSomething
-            $ recordMetricWithLabel
-              granularPrometheusMetricsState
-              True
-              (GaugeVector.dec numSubscriptionMetric promMetricGranularLabel)
-              (GaugeVector.dec numSubscriptionMetric promMetricLabel)
+        else return (pure ())
 
 -- | An async action query whose relationships are referred to table in a source.
 -- We need to generate an SQL statement with the action response and execute it
