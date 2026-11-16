@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret to the raw serve options. See BBB-CHANGES.md.
+-- adds the metrics secret to the raw serve options and tests that an empty one counts as
+-- not set. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 module Hasura.Server.InitSpec
@@ -328,6 +329,17 @@ mkServeOptionsSpec =
             result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura rawServeOptions)
 
         fmap UUT.soAdminSecret result `Hspec.shouldBe` Right (Set.singleton (Auth.hashAdminSecret "Whats the big deal"))
+
+    Hspec.describe "soMetricsSecret" $ do
+      Hspec.it "Env > Nothing" $ do
+        let env = [(UUT._envVar UUT.metricsSecretOption, "metrics secret")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right (Just (Auth.hashAdminSecret "metrics secret"))
+
+      Hspec.it "an empty secret counts as not set" $ do
+        let env = [(UUT._envVar UUT.metricsSecretOption, "")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right Nothing
 
     Hspec.describe "soAuthHook" $ do
       Hspec.it "Default Hook Mode == GET" $ do

@@ -1793,5 +1793,5 @@ metricsSecretOption =
   Config.Option
     { Config._default = (),
       Config._envVar = "HASURA_GRAPHQL_METRICS_SECRET",
-      Config._helpMessage = "Secret key for the metrics endpoint, sent as \"Authorization: Bearer <secret>\" (if not set, the metrics endpoint rejects every request with 401)"
+      Config._helpMessage = "Secret key for the metrics endpoint, sent as \"Authorization: Bearer <secret>\" (if not set or empty, the metrics endpoint rejects every request with 401)"
     }
