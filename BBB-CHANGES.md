@@ -121,6 +121,16 @@ For a streaming subscription, `buildSubscriptionPlan` in
 the plan, and each run validates the subscription's variables against Postgres. The plan
 is now built once and both parts come from that result.
 
+## One observation per subscription poll
+
+`recordSubscriptionMetric` records the total and database times of a subscription poll
+for every operation name the poller serves. With granular metrics off, which drops the
+name from the label, it still recorded once per name, so a poll serving three names was
+observed three times in the unlabeled series. It now records once per name with granular
+metrics on and once per poll with them off, so the `_count` of
+`hasura_subscription_total_time_seconds` is the number of polls and the `_count` of
+`hasura_subscription_db_execution_time_seconds` the number of batches.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -165,5 +175,10 @@ Every file below carries a modification notice at the top, as required by Apache
   vacuously.
 - `server/src-lib/Hasura/GraphQL/Execute.hs`: builds the streaming subscription plan once
   (see "Streaming subscription plan built once" above).
+- `server/src-lib/Hasura/Server/Prometheus.hs`: `recordSubscriptionMetric` observes a poll
+  once when granular metrics are off (see "One observation per subscription poll" above).
+- `server/src-test/Hasura/Server/PrometheusSpec.hs` and
+  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`: test the subscription
+  poll observations, with and without granular metrics.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

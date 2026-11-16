@@ -1,3 +1,5 @@
+{-# LANGUAGE QuasiQuotes #-}
+
 -- Added by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- tests for the store-backed Prometheus metrics. See BBB-CHANGES.md.
 
@@ -13,21 +15,69 @@ module Hasura.Server.PrometheusSpec (spec) where
 
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
+import Data.HashMap.Strict qualified as HashMap
+import Data.Int (Int64)
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Hasura.GraphQL.ParameterizedQueryHash (mkUnsafeParameterizedQueryHash)
+import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Common (defaultSource)
 import Hasura.Server.Prometheus
+import Hasura.Server.Types (GranularPrometheusMetricsState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
+import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import System.Metrics.Prometheus qualified as Prometheus
 import System.Metrics.Prometheus.CounterVector qualified as CounterVector
 import System.Metrics.Prometheus.Export qualified as PromExport
 import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
+import System.Metrics.Prometheus.Histogram (HistogramSample (..))
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
 import Test.Hspec
 
 spec :: Spec
-spec = describe "makePrometheusMetrics" $ do
+spec = do
+  makePrometheusMetricsSpec
+  recordSubscriptionMetricSpec
+
+-- | A subscription poll serving several operation names is observed once per
+-- name with granular metrics (each observation carries its name) and once
+-- without them.
+recordSubscriptionMetricSpec :: Spec
+recordSubscriptionMetricSpec = describe "recordSubscriptionMetric" $ do
+  let operationNames =
+        HashMap.fromList
+          [ (Just (OperationName [G.name|first|]), 1),
+            (Just (OperationName [G.name|second|]), 2)
+          ]
+      queryHash = mkUnsafeParameterizedQueryHash "hash"
+      labelFor operationName = SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (Just queryHash) operationName))
+      observationsOnePoll metricsState = do
+        histogram <- HistogramVector.new []
+        recordSubscriptionMetric (pure metricsState) True operationNames queryHash streamingSubscriptionLabel \label ->
+          HistogramVector.observe histogram label 0.5
+        countsByLabels <$> HistogramVector.read histogram
+  it "observes a poll once without granular metrics" $ do
+    observationsOnePoll GranularMetricsOff
+      `shouldReturn` expectedCounts [(SubscriptionLabel streamingSubscriptionLabel Nothing, 1)]
+  it "observes a poll once per operation name with granular metrics" $ do
+    observationsOnePoll GranularMetricsOn
+      `shouldReturn` expectedCounts
+        [ (labelFor (Just (OperationName [G.name|first|])), 1),
+          (labelFor (Just (OperationName [G.name|second|])), 1)
+        ]
+
+-- | The observation count of each series of a histogram vector, keyed by the
+-- series' label names and values (the label types have no 'Show' instance).
+countsByLabels :: (Prometheus.ToLabels l) => Map.Map l HistogramSample -> [([(Text, Text)], Int64)]
+countsByLabels = expectedCounts . map (fmap histCount) . Map.toList
+
+expectedCounts :: (Prometheus.ToLabels l) => [(l, Int64)] -> [([(Text, Text)], Int64)]
+expectedCounts = sort . map (first (sort . HashMap.toList . Prometheus.toLabels))
+
+makePrometheusMetricsSpec :: Spec
+makePrometheusMetricsSpec = describe "makePrometheusMetrics" $ do
   it "registers every metric and exports the expected # TYPE lines" $ do
     store <- Prometheus.newStore @PrometheusMetricsSpec
     -- Throws a RegistrationError if the metric specification contains a

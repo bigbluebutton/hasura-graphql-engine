@@ -1,8 +1,9 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds a metric specification and a store-backed constructor for the Prometheus
--- metrics, used by the GET /v1/metrics endpoint. See BBB-CHANGES.md.
+-- adds a metric specification and a store-backed constructor for the Prometheus metrics,
+-- used by the GET /v1/metrics endpoint; observes a subscription poll once when granular
+-- metrics are off. See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -507,15 +508,15 @@ recordSubscriptionMetric getMetricState alwaysObserve operationNamesMap paramete
         (metricAction promMetricGranularLabel)
         (metricAction promMetricLabel)
     else -- if operationNames are present, then emit the same metric for all the operation names
-    do
-      let operationNames = HashMap.keys operationNamesMap
-      for_ operationNames $ \opName -> do
-        let promMetricGranularLabel = SubscriptionLabel subscriptionKind (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) opName)
+      do
+        -- without granular metrics the value is observed once, as it comes from a single poll
+        let operationNames = HashMap.keys operationNamesMap
+            promMetricGranularLabel opName = SubscriptionLabel subscriptionKind (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) opName)
             promMetricLabel = SubscriptionLabel subscriptionKind Nothing
         recordMetricWithLabel
           getMetricState
           alwaysObserve
-          (metricAction promMetricGranularLabel)
+          (for_ operationNames (metricAction . promMetricGranularLabel))
           (metricAction promMetricLabel)
 
 recordGraphqlOperationMetric ::

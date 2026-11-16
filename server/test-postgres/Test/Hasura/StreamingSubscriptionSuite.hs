@@ -1,7 +1,8 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- tests the poller's operation name count when subscribers of one name are removed from two
--- cohorts, and the count and the active subscriptions gauge when a subscriber that is in
--- two cohorts is removed. See BBB-CHANGES.md.
+-- tests the poller's operation name count, and the poll metrics that use it, when
+-- subscribers of one name are removed from two cohorts, and the count and the active
+-- subscriptions gauge when a subscriber that is in two cohorts is removed. See BBB-
+-- CHANGES.md.
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
@@ -17,6 +18,7 @@ import Control.Lens ((.~))
 import Data.Aeson qualified as J
 import Data.ByteString.Lazy.UTF8 qualified as LBS
 import Data.HashMap.Strict qualified as HashMap
+import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
@@ -48,7 +50,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), makeDummyPrometheusMetrics, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), makeDummyPrometheusMetrics, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
@@ -56,7 +58,10 @@ import StmContainers.Map qualified as STMMap
 import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
 import System.Metrics
+import System.Metrics.Prometheus qualified as Prometheus
 import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
+import System.Metrics.Prometheus.Histogram (HistogramSample (..))
+import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
 import Test.Hspec
 
 buildStreamingSubscriptionSuite :: IO Spec
@@ -502,6 +507,80 @@ streamingSubscriptionPollingSpec srcConfig = do
         STM.atomically (TMap.lookup operationName (_pOperationNamesMap poller)) `shouldReturn` Nothing
         isNothing <$> pollerOf `shouldReturn` True
 
+    describe "Poll metrics of one operation name spread over two cohorts, after one subscriber is removed" $ do
+      subscriptionState <- runIO $ initSubscriptionsState (const (pure ()))
+      dummyWSId <- runIO $ WS.mkUnsafeWSId <$> UUID.nextRandom
+      (cohortIdA, cohortIdB) <- runIO $ (,) <$> newCohortId <*> newCohortId
+      let operationName = Just $ OperationName [G.name|NumbersStream|]
+          parameterizedSubscriptionQueryPlan = ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery multiplexedQuery
+          queryPlanFor cohortId cohortKey = SubscriptionQueryPlan parameterizedSubscriptionQueryPlan srcConfig cohortId Nothing cohortKey Nothing
+          subOptions = mkSubscriptionsOptions Nothing Nothing
+          quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+          addSubscriber opId reqId queryPlan =
+            addStreamSubscriptionQuery
+              @('Postgres 'Vanilla)
+              quietLogger
+              dummyServerMetrics
+              dummyPromMetrics
+              (mkSubscriberMetadata dummyWSId (unsafeMkOperationId opId) Nothing reqId)
+              subscriptionState
+              (pure (subOptions, subOptions))
+              SNDefault
+              paramQueryHash
+              operationName
+              reqId
+              [G.name|numbers_stream|]
+              queryPlan
+              (pure GranularMetricsOff)
+              (const (pure ()))
+              Nothing
+              []
+              (pure ModelInfoLogOff)
+          removeSubscriber subscriberDetails =
+            removeStreamingQuery quietLogger dummyServerMetrics dummyPromMetrics subscriptionState subscriberDetails (pure GranularMetricsOff) operationName
+          -- One poll of the poller's cohorts, recorded in a fresh set of metrics.
+          pollOnce metricsState = do
+            entries <- STM.atomically $ ListT.toList $ STMMap.listT (_ssStreamQueryMap subscriptionState)
+            Poller pollerCohorts _ _ _ pollerOperationNames <- maybe (error "no poller") (pure . snd) (listToMaybe entries)
+            promMetrics <- makeDummyPrometheusMetrics
+            pollStreamingQuery
+              @('Postgres 'Vanilla)
+              pollerId
+              pollerResponseState
+              defaultSubscriptionOptions
+              (SNDefault, srcConfig)
+              (mkRoleNameE "user")
+              paramQueryHash
+              (MultiplexedQuery multiplexedQuery)
+              pollerCohorts
+              [G.name|numbers_stream|]
+              (const $ pure ())
+              Nothing
+              promMetrics
+              (pure metricsState)
+              pollerOperationNames
+              Nothing
+              Nothing
+              quietLogger
+              []
+              (pure ModelInfoLogOff)
+            seriesCounts <$> HistogramVector.read (submTotalTime $ pmSubscriptionMetrics promMetrics)
+          streamingLabel = SubscriptionLabel streamingSubscriptionLabel
+
+      subscriberA <- runIO $ addSubscriber "a" (RequestId "request-id-a") (queryPlanFor cohortIdA (mkCohortKey "10"))
+      subscriberB <- runIO $ addSubscriber "b" (RequestId "request-id-b") (queryPlanFor cohortIdB (mkCohortKey "20"))
+      runIO $ removeSubscriber subscriberA
+      granularObservations <- runIO $ pollOnce GranularMetricsOn
+      plainObservations <- runIO $ pollOnce GranularMetricsOff
+      runIO $ removeSubscriber subscriberB
+
+      it "with granular metrics, the poll is still recorded under the remaining subscriber's operation name" $ do
+        granularObservations
+          `shouldBe` labeledCounts [(streamingLabel (Just (DynamicGraphqlOperationLabel (Just paramQueryHash) operationName)), 1)]
+
+      it "without granular metrics, the poll is recorded once" $ do
+        plainObservations `shouldBe` labeledCounts [(streamingLabel Nothing, 1)]
+
     describe "A subscriber added during a poll in which its cohort's key advances" $ do
       -- The poll runs here, while the spec is built and the "numbers" table still exists, so
       -- the cursor really advances (a poll inside an "it" runs after the teardown).
@@ -661,6 +740,14 @@ streamingSubscriptionPollingSpec srcConfig = do
         activeBeforeAndAfter `shouldBe` (1, 0)
 
   runIO teardown
+
+-- | The observation count of each series of a histogram vector, keyed by the
+-- series' label names and values (the label types have no 'Show' instance).
+seriesCounts :: (Prometheus.ToLabels l) => Map.Map l HistogramSample -> [([(Text, Text)], Int64)]
+seriesCounts = labeledCounts . map (fmap histCount) . Map.toList
+
+labeledCounts :: (Prometheus.ToLabels l) => [(l, Int64)] -> [([(Text, Text)], Int64)]
+labeledCounts = sort . map (first (sort . HashMap.toList . Prometheus.toLabels))
 
 printErrExit :: Text -> IO a
 printErrExit = (*> exitFailure) . T.putStrLn
