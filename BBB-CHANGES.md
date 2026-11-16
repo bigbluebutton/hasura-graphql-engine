@@ -114,6 +114,13 @@ as a bug), the base did not count the gauge down, for live queries or streaming
 subscriptions, and now it does for both, which matches the unconditional count up when the
 subscriber was added.
 
+## Streaming subscription plan built once
+
+For a streaming subscription, `buildSubscriptionPlan` in
+`Hasura.GraphQL.Execute` ran the plan builder twice, once for the model info and once for
+the plan, and each run validates the subscription's variables against Postgres. The plan
+is now built once and both parts come from that result.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -156,5 +163,7 @@ Every file below carries a modification notice at the top, as required by Apache
   subscriber in the appropriate cohort", which ran its poll after the suite's teardown had
   dropped the table, so the cohort's key never advanced and its assertions passed
   vacuously.
+- `server/src-lib/Hasura/GraphQL/Execute.hs`: builds the streaming subscription plan once
+  (see "Streaming subscription plan built once" above).
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

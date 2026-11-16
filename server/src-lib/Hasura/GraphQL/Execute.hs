@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- builds the streaming subscription plan once instead of twice. See BBB-CHANGES.md.
 module Hasura.GraphQL.Execute
   ( EB.ExecutionStep (..),
     ResolvedExecutionPlan (..),
@@ -164,13 +166,11 @@ buildSubscriptionPlan removeEmptySubscriptionResponses userInfo rootFields param
                                   operationName
                               )
                               queryTagsComment
-                      modelInfo <- snd <$> mkDBStreamingSubscriptionPlanResult
-                      subscriptionPlan' <-
-                        SubscriptionQueryPlan
-                          . AB.mkAnyBackend
-                          . MultiplexedSubscriptionQueryPlan
-                          . fst
-                          <$> mkDBStreamingSubscriptionPlanResult
+                      (streamingPlan, modelInfo) <- mkDBStreamingSubscriptionPlanResult
+                      let subscriptionPlan' =
+                            SubscriptionQueryPlan
+                              $ AB.mkAnyBackend
+                              $ MultiplexedSubscriptionQueryPlan streamingPlan
                       pure (subscriptionPlan', modelInfo)
                   pure
                     $ (,[])
