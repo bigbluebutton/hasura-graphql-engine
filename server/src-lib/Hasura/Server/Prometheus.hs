@@ -3,7 +3,8 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- adds a metric specification and a store-backed constructor for the Prometheus metrics,
 -- used by the GET /v1/metrics endpoint; observes a subscription poll once when granular
--- metrics are off. See BBB-CHANGES.md.
+-- metrics are off; says in the help of the subscription database time that the pool wait is
+-- left out. See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -707,7 +708,7 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
   SubscriptionDbExecutionTimeSeconds ::
     PrometheusMetricsSpec
       "hasura_subscription_db_execution_time_seconds"
-      "Time spent executing the subscription query in the database, in seconds"
+      "Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"
       'HistogramType
       SubscriptionLabel
   ActiveSubscriptions ::

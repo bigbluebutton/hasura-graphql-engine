@@ -40,6 +40,17 @@ spec :: Spec
 spec = do
   makePrometheusMetricsSpec
   recordSubscriptionMetricSpec
+  dbExecutionTimeHelpSpec
+
+dbExecutionTimeHelpSpec :: Spec
+dbExecutionTimeHelpSpec = describe "hasura_subscription_db_execution_time_seconds" $ do
+  it "says in its help that the pool wait is left out" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observeEveryVectorOnce metrics
+    rendered <- renderSample metrics
+    filter ("# HELP hasura_subscription_db_execution_time_seconds " `T.isPrefixOf`) (T.lines rendered)
+      `shouldBe` ["# HELP hasura_subscription_db_execution_time_seconds Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"]
 
 -- | A subscription poll serving several operation names is observed once per
 -- name with granular metrics (each observation carries its name) and once
@@ -92,6 +103,12 @@ makePrometheusMetricsSpec = describe "makePrometheusMetrics" $ do
             $ PromExport.sampleToPrometheus sample
         typeLines = sort $ filter ("# TYPE " `T.isPrefixOf`) $ T.lines rendered
     typeLines `shouldBe` expectedTypeLines
+
+-- | The store's sample in the Prometheus text format.
+renderSample :: PrometheusMetrics -> IO Text
+renderSample metrics = do
+  sample <- pmSample metrics
+  pure $ TE.decodeUtf8 $ BL.toStrict $ BB.toLazyByteString $ PromExport.sampleToPrometheus sample
 
 -- | Drive one observation through every vector metric so that each of them
 -- shows up in the sample (empty vector groups are discarded by the exporter).

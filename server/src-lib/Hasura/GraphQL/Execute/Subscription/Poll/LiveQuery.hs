@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- does not observe the database time of a poll batch that ran no query. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | Multiplexed subscription poller threads; see "Hasura.GraphQL.Execute.Subscription" for details.
@@ -118,16 +120,19 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
 
     -- concurrently process each batch
     batchesDetailsWithMaybeError <- A.forConcurrently cohortBatches $ \(batchId, cohorts) -> do
-      (queryExecutionTime, mxRes) <- runDBSubscription @b sourceConfig query (over (each . _2) C._csVariables cohorts) resolvedConnectionTemplate
+      (maybeQueryExecutionTime, mxRes) <- runDBSubscription @b sourceConfig query (over (each . _2) C._csVariables cohorts) resolvedConnectionTemplate
 
       let dbExecTimeMetric = submDBExecTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
-      recordSubscriptionMetric
-        granularPrometheusMetricsState
-        True
-        operationNamesMap
-        parameterizedQueryHash
-        liveQuerySubscriptionLabel
-        (flip (HistogramVector.observe dbExecTimeMetric) (realToFrac queryExecutionTime))
+      -- A batch that got no pool connection ran no query, and has no database time to observe.
+      for_ maybeQueryExecutionTime \queryExecutionTime' ->
+        recordSubscriptionMetric
+          granularPrometheusMetricsState
+          True
+          operationNamesMap
+          parameterizedQueryHash
+          liveQuerySubscriptionLabel
+          (flip (HistogramVector.observe dbExecTimeMetric) (realToFrac queryExecutionTime'))
+      let queryExecutionTime = fromMaybe 0 maybeQueryExecutionTime
 
       previousPollerResponseState <- STM.readTVarIO pollerResponseState
 

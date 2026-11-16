@@ -1,8 +1,9 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- tests the poller's operation name count, and the poll metrics that use it, when
--- subscribers of one name are removed from two cohorts, and the count and the active
--- subscriptions gauge when a subscriber that is in two cohorts is removed. See BBB-
--- CHANGES.md.
+-- subscribers of one name are removed from two cohorts; the count and the active
+-- subscriptions gauge when a subscriber that is in two cohorts is removed; and the database
+-- execution time of a subscription query that waits for a pool connection or that ends with
+-- a statement error or an exception. See BBB-CHANGES.md.
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
@@ -10,14 +11,17 @@
 
 module Test.Hasura.StreamingSubscriptionSuite (buildStreamingSubscriptionSuite) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async qualified as Async
 import Control.Concurrent.MVar qualified as MVar
 import Control.Concurrent.STM qualified as STM
+import Control.Exception qualified as Exception
 import Control.Immortal qualified as Immortal
 import Control.Lens ((.~))
 import Data.Aeson qualified as J
 import Data.ByteString.Lazy.UTF8 qualified as LBS
 import Data.HashMap.Strict qualified as HashMap
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
@@ -28,16 +32,18 @@ import Database.PG.Query qualified as PG
 import Hasura.Authentication.Role (RoleName, mkRoleName)
 import Hasura.Backends.Postgres.Connection
 import Hasura.Backends.Postgres.Execute.Subscription (MultiplexedQuery (MultiplexedQuery))
-import Hasura.Backends.Postgres.Instances.Transport ()
+import Hasura.Backends.Postgres.Instances.Transport (withQueryExecutionTime)
 import Hasura.Backends.Postgres.SQL.Value (TxtEncodedVal (TELit))
-import Hasura.Base.Error (showQErr)
+import Hasura.Base.Error (Code (Unexpected), QErr, err500, showQErr)
 import Hasura.GraphQL.Execute.Subscription.Options (mkSubscriptionsOptions)
 import Hasura.GraphQL.Execute.Subscription.Plan
 import Hasura.GraphQL.Execute.Subscription.Poll.Common
+import Hasura.GraphQL.Execute.Subscription.Poll.LiveQuery (pollLiveQuery)
 import Hasura.GraphQL.Execute.Subscription.Poll.StreamingQuery (pollStreamingQuery)
 import Hasura.GraphQL.Execute.Subscription.State
 import Hasura.GraphQL.Execute.Subscription.TMap qualified as TMap
 import Hasura.GraphQL.ParameterizedQueryHash
+import Hasura.GraphQL.Transport.Backend (BackendTransport (..))
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.GraphQL.Transport.WebSocket.Protocol (unsafeMkOperationId)
 import Hasura.GraphQL.Transport.WebSocket.Server qualified as WS
@@ -50,7 +56,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), makeDummyPrometheusMetrics, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
@@ -86,9 +92,13 @@ buildStreamingSubscriptionSuite = do
   let pgContext = mkPGExecCtx PG.ReadCommitted pgPool NeverResizePool
       dbSourceConfig = PGSourceConfig pgContext connInfoWithFinalizer Nothing (pure ()) defaultPostgresExtensionsSchema mempty ConnTemplate_NotApplicable
 
+  -- A pool of one connection that gives up waiting for it after 1 s (the pool counts its timeout
+  -- in whole seconds), destroyed by the test that uses it.
+  timeoutPool <- PG.initPGPool pgConnInfo J.Null PG.defaultConnParams {PG.cpConns = 1, PG.cpTimeout = Just 1} print
+
   pure
     $ describe "Streaming subscriptions polling tests"
-    $ streamingSubscriptionPollingSpec dbSourceConfig
+    $ streamingSubscriptionPollingSpec dbSourceConfig timeoutPool
 
 mkRoleNameE :: Text -> RoleName
 mkRoleNameE = fromMaybe (error "Use a non empty string") . mkRoleName
@@ -109,8 +119,8 @@ getStaticCohortSnapshot (Cohort cohortId _respRef existingSubsTV newSubsTV _) = 
   newSubs <- TMap.toList newSubsTV
   pure $ CohortStaticSnapshot cohortId (fst <$> existingSubs) (fst <$> newSubs)
 
-streamingSubscriptionPollingSpec :: SourceConfig ('Postgres 'Vanilla) -> Spec
-streamingSubscriptionPollingSpec srcConfig = do
+streamingSubscriptionPollingSpec :: SourceConfig ('Postgres 'Vanilla) -> PG.PGPool -> Spec
+streamingSubscriptionPollingSpec srcConfig timeoutPool = do
   dummyServerStore <- runIO newStore
   dummyServerMetrics <- runIO $ createServerMetrics dummyServerStore
   dummyPromMetrics <- runIO makeDummyPrometheusMetrics
@@ -739,7 +749,112 @@ streamingSubscriptionPollingSpec srcConfig = do
       it "counts the active subscriptions down" $ do
         activeBeforeAndAfter `shouldBe` (1, 0)
 
+    describe "Database execution time of a subscription query while the pool is exhausted" $ do
+      cohortId <- runIO newCohortId
+      let -- Holds one of the pool's connections for 1.5 s.
+          holdConnection =
+            runPgSourceWriteTx srcConfig InternalRawQuery (PG.unitQE defaultTxErrorHandler [PG.sql| DO $$ BEGIN PERFORM pg_sleep(1.5); END $$ |] () False)
+              >>= (`onLeft` (printErrExit . showQErr))
+          runSubscriptionQuery =
+            runDBStreamingSubscription @('Postgres 'Vanilla) srcConfig (MultiplexedQuery multiplexedQuery) [(cohortId, cohortKey1)] Nothing
+      (wallTime, (reportedTime, queryResult)) <-
+        runIO
+          $ Async.withAsync (Async.replicateConcurrently_ testPoolSize holdConnection)
+          $ \holders -> do
+            -- Let the holders take every connection of the pool first.
+            threadDelay 300000
+            measured <- withElapsedTime runSubscriptionQuery
+            Async.wait holders
+            pure measured
+
+      it "the query waited for a pool connection" $ do
+        either (const False) (const True) queryResult `shouldBe` True
+        wallTime `shouldSatisfy` (> 1)
+
+      it "the reported database execution time leaves the wait out" $ do
+        reportedTime `shouldSatisfy` maybe False (< 0.5)
+
+    describe "A poll batch that gets no pool connection" $ do
+      -- One streaming and one live query poll, run while the one connection of a pool that
+      -- gives up waiting after 1 s is held: their batch runs no query. The subscriptions are
+      -- added with other metrics than the polls run here, so that the first poll of the
+      -- pollers' own threads, before they are stopped, is not counted.
+      (failedBatches, dbTimeCounts, pollCounts) <- runIO do
+        let timeoutSrcConfig = srcConfig {_pscExecCtx = mkPGExecCtx PG.ReadCommitted timeoutPool NeverResizePool}
+        subscriptionState <- initSubscriptionsState (const (pure ()))
+        promMetrics <- makeDummyPrometheusMetrics
+        wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
+        (streamCohortId, liveCohortId) <- (,) <$> newCohortId <*> newCohortId
+        polls <- newIORef ([] :: [PollDetails])
+        let quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+            options = mkSubscriptionsOptions Nothing Nothing
+            liveQuery =
+              [PG.sql|
+                SELECT "_subs"."result_id", json_build_object('numbers', (SELECT coalesce(json_agg("id" ORDER BY "id"), '[]') FROM "public"."numbers"))::text AS "result"
+                FROM UNNEST(($1)::uuid[], ($2)::json[]) AS "_subs"("result_id", "result_vars")
+              |]
+            plan query cohortId cohortKey =
+              SubscriptionQueryPlan (ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery query) srcConfig cohortId Nothing cohortKey Nothing
+            subscriber name = mkSubscriberMetadata wsId (unsafeMkOperationId name) Nothing (RequestId name)
+            keepPoll details = atomicModifyIORef' polls (\ds -> (ds <> [details], ()))
+            stopThread poller = STM.atomically (STM.readTMVar (_pIOState poller)) >>= Immortal.stop . _pThread
+            -- Takes the pool's connection, says so on "held", and keeps it for 3 s.
+            holdConnection held =
+              runPgSourceWriteTx timeoutSrcConfig InternalRawQuery (liftIO (void (MVar.tryPutMVar held ())) >> PG.unitQE defaultTxErrorHandler [PG.sql| DO $$ BEGIN PERFORM pg_sleep(3); END $$ |] () False)
+                >>= (`onLeft` (printErrExit . showQErr))
+        _ <-
+          addStreamSubscriptionQuery @('Postgres 'Vanilla) quietLogger dummyServerMetrics dummyPromMetrics (subscriber "s1") subscriptionState (pure (options, options)) SNDefault paramQueryHash Nothing (RequestId "s1") [G.name|numbers_stream|] (plan multiplexedQuery streamCohortId cohortKey1) (pure GranularMetricsOff) (const (pure ())) Nothing [] (pure ModelInfoLogOff)
+        _ <-
+          addLiveQuery @('Postgres 'Vanilla) quietLogger dummyServerMetrics dummyPromMetrics (subscriber "l1") subscriptionState (pure (options, options)) SNDefault paramQueryHash Nothing (RequestId "l1") (plan liveQuery liveCohortId (mkCohortVariables mempty mempty mempty mempty mempty)) (pure GranularMetricsOff) (const (pure ())) Nothing [] (pure ModelInfoLogOff)
+        streamPoller <- maybe (error "no streaming poller") pure . listToMaybe . fmap snd =<< STM.atomically (ListT.toList (STMMap.listT (_ssStreamQueryMap subscriptionState)))
+        livePoller <- maybe (error "no live query poller") pure . listToMaybe . fmap snd =<< STM.atomically (ListT.toList (STMMap.listT (_ssLiveQueryMap subscriptionState)))
+        stopThread streamPoller
+        stopThread livePoller
+        held <- MVar.newEmptyMVar
+        Async.withAsync (holdConnection held) \holder -> do
+          MVar.takeMVar held
+          pollStreamingQuery @('Postgres 'Vanilla) pollerId (_pPollerState streamPoller) options (SNDefault, timeoutSrcConfig) (mkRoleNameE "user") paramQueryHash (MultiplexedQuery multiplexedQuery) (_pCohorts streamPoller) [G.name|numbers_stream|] keepPoll Nothing promMetrics (pure GranularMetricsOff) (_pOperationNamesMap streamPoller) Nothing Nothing quietLogger [] (pure ModelInfoLogOff)
+          pollLiveQuery @('Postgres 'Vanilla) pollerId (_pPollerState livePoller) options (SNDefault, timeoutSrcConfig) (mkRoleNameE "user") paramQueryHash (MultiplexedQuery liveQuery) (_pCohorts livePoller) keepPoll promMetrics (pure GranularMetricsOff) (_pOperationNamesMap livePoller) Nothing Nothing quietLogger [] (pure ModelInfoLogOff)
+          Async.wait holder
+        PG.destroyPGPool timeoutPool
+        let SubscriptionMetrics {..} = pmSubscriptionMetrics promMetrics
+        (,,)
+          <$> (map (maybe 0 length . _pdErrors) <$> readIORef polls)
+          <*> (seriesCounts <$> HistogramVector.read submDBExecTotalTime)
+          <*> (seriesCounts <$> HistogramVector.read submTotalTime)
+
+      it "each poll has one failed batch" $ do
+        failedBatches `shouldBe` [1, 1]
+
+      it "the batch is not observed in the database execution time" $ do
+        dbTimeCounts `shouldBe` []
+
+      it "the poll is still observed in the poll time" $ do
+        pollCounts `shouldBe` labeledCounts [(SubscriptionLabel streamingSubscriptionLabel Nothing, 1), (SubscriptionLabel liveQuerySubscriptionLabel Nothing, 1)]
+
+    describe "Database execution time of a query that does not end with a result" $ do
+      -- runQueryTx turns a lost connection, an exception, into an error after the query, so
+      -- the exception is caught here the same way, outside the timed query.
+      let timeFailingQuery :: ExceptT QErr IO () -> IO (Maybe DiffTime, Either ConnectionLost (Either QErr ()))
+          timeFailingQuery failingQuery = withQueryExecutionTime \timeQuery -> Exception.try $ runExceptT $ timeQuery failingQuery
+      (timeOfStatementError, statementError) <- runIO $ timeFailingQuery (liftIO (threadDelay 200000) >> throwError (err500 Unexpected "statement failed"))
+      (timeOfException, exception) <- runIO $ timeFailingQuery (liftIO (threadDelay 200000 >> Exception.throwIO ConnectionLost))
+
+      it "a statement error is returned, with the time until it" $ do
+        either (const False) (either (const True) (const False)) statementError `shouldBe` True
+        timeOfStatementError `shouldSatisfy` maybe False (>= 0.2)
+
+      it "an exception is rethrown unchanged, with the time until it" $ do
+        either (const True) (const False) exception `shouldBe` True
+        timeOfException `shouldSatisfy` maybe False (>= 0.2)
+
   runIO teardown
+
+-- | Stands for the exception a query throws when its connection is lost.
+data ConnectionLost = ConnectionLost
+  deriving stock (Show)
+
+instance Exception.Exception ConnectionLost
 
 -- | The observation count of each series of a histogram vector, keyed by the
 -- series' label names and values (the label types have no 'Show' instance).
@@ -748,6 +863,10 @@ seriesCounts = labeledCounts . map (fmap histCount) . Map.toList
 
 labeledCounts :: (Prometheus.ToLabels l) => [(l, Int64)] -> [([(Text, Text)], Int64)]
 labeledCounts = sort . map (first (sort . HashMap.toList . Prometheus.toLabels))
+
+-- | Connections in the pool this suite builds ('PG.defaultConnParams').
+testPoolSize :: Int
+testPoolSize = PG.cpConns PG.defaultConnParams
 
 printErrExit :: Text -> IO a
 printErrExit = (*> exitFailure) . T.putStrLn

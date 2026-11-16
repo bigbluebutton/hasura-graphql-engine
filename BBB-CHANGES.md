@@ -129,7 +129,34 @@ name from the label, it still recorded once per name, so a poll serving three na
 observed three times in the unlabeled series. It now records once per name with granular
 metrics on and once per poll with them off, so the `_count` of
 `hasura_subscription_total_time_seconds` is the number of polls and the `_count` of
-`hasura_subscription_db_execution_time_seconds` the number of batches.
+`hasura_subscription_db_execution_time_seconds` the number of batches (that ran a query,
+see the next section).
+
+## Subscription database time without the pool wait
+
+`runPGSubscription` and `runPGStreamingSubscription` in
+`Hasura.Backends.Postgres.Instances.Transport` timed the whole call, which includes the
+wait for a connection from the Postgres pool, so
+`hasura_subscription_db_execution_time_seconds` and the `db_execution_time` of the
+poller log grew with the pool wait. The timer now starts and stops inside the
+transaction, around the query, and the time is taken however the query ends: with a
+result, with a statement error, or with an exception such as the connection being lost
+(which `runQueryTx` turns into an error afterwards; the exception itself is rethrown
+unchanged). When no connection could be obtained the query never starts: no time is
+reported, and the poll does not observe the batch in
+`hasura_subscription_db_execution_time_seconds`, so that a batch without a query does
+not add a zero to it; the `_count` of that histogram is the number of batches that ran a
+query. Such a batch still fails, and the poller log reports 0 for its `db_execution_time`.
+The Postgres `runDBSubscription` and `runDBStreamingSubscription` of `BackendTransport`
+return `Nothing` for the time in that case; the MS SQL Server `runDBSubscription` returns the
+time of the whole call, as before, and never `Nothing`.
+The test of the exception case calls the real `withQueryExecutionTime` with a
+simulated query that throws: a real connection drop was not tested, because a lost
+connection goes through the pg-client retry (`pgRetrying` resets the connection and runs the
+statement again), which makes it neither certain nor repeatable that the timed query ends
+with the exception.
+The help of `hasura_subscription_db_execution_time_seconds` says the pool wait is left
+out.
 
 ## Modified upstream files
 
@@ -180,5 +207,18 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-test/Hasura/Server/PrometheusSpec.hs` and
   `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`: test the subscription
   poll observations, with and without granular metrics.
+- `server/src-lib/Hasura/Backends/Postgres/Instances/Transport.hs`: times subscription
+  queries inside the transaction (see "Subscription database time without the pool wait"
+  above), and exports `withQueryExecutionTime` for its test.
+- `server/src-lib/Hasura/GraphQL/Transport/Backend.hs`: the subscription methods of
+  `BackendTransport` return no time for a query that never started, and
+  `server/src-lib/Hasura/Backends/MSSQL/Instances/Transport.hs` follows the new type.
+- `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/LiveQuery.hs` and
+  `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/StreamingQuery.hs`: do not
+  observe the database time of a batch that ran no query.
+- `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`: also tests the
+  database time of a subscription query that waits for a pool connection, of one that
+  ends with a statement error or an exception, and of a poll batch that gets no
+  connection.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
