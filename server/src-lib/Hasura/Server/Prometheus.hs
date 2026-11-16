@@ -4,8 +4,9 @@
 -- adds a metric specification and a store-backed constructor for the Prometheus metrics,
 -- used by the GET /v1/metrics endpoint; observes a subscription poll once when granular
 -- metrics are off; says in the help of the subscription database time that the pool wait is
--- left out; describes what a full websocket send queue does in the help of its counter. See
--- BBB-CHANGES.md.
+-- left out; describes what a full websocket send queue does in the help of its counter;
+-- adds the Postgres pool metrics and the pool observer that records them. See BBB-
+-- CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -49,6 +50,12 @@ module Hasura.Server.Prometheus
     recordSubscriptionMetric,
     GraphQLRequestsLabels (..),
     recordGraphqlOperationMetric,
+    PostgresPoolMetrics (..),
+    PostgresPoolLabel (..),
+    PostgresPoolClosedLabel (..),
+    sourcePoolLabel,
+    metadataPoolLabel,
+    postgresPoolObserver,
   )
 where
 
@@ -58,6 +65,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as OrdMap
+import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
 import GHC.TypeLits (Symbol)
 import Hasura.GraphQL.ParameterizedQueryHash
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
@@ -125,12 +133,88 @@ data PrometheusMetrics = PrometheusMetrics
     pmWebsocketMsgDropped :: Counter,
     pmCacheRequestMetrics :: CacheRequestMetrics,
     pmOpenTelemetryMetrics :: OpenTelemetryMetrics,
+    pmPostgresPoolMetrics :: PostgresPoolMetrics,
     -- | Sample every metric registered to the Prometheus metrics store.
     -- 'makeDummyPrometheusMetrics' returns an empty sample; the sample of
     -- 'makePrometheusMetrics' covers all the metrics above that are backed
     -- by its store.
     pmSample :: IO Sample
   }
+
+-- | How the Postgres pools serve and manage their connections, one series per pool
+-- ('PostgresPoolLabel'). A pool that is recreated for the same source keeps adding to the same
+-- series.
+data PostgresPoolMetrics = PostgresPoolMetrics
+  { ppmWaitTime :: HistogramVector PostgresPoolLabel,
+    ppmWaitingRequests :: GaugeVector.GaugeVector PostgresPoolLabel,
+    ppmConnectionsInUse :: GaugeVector.GaugeVector PostgresPoolLabel,
+    ppmConnectionsOpen :: GaugeVector.GaugeVector PostgresPoolLabel,
+    ppmMaxConnections :: GaugeVector.GaugeVector PostgresPoolLabel,
+    ppmConnectionInitTime :: HistogramVector PostgresPoolLabel,
+    ppmConnectionErrors :: CounterVector PostgresPoolLabel,
+    ppmConnectionsClosed :: CounterVector PostgresPoolClosedLabel,
+    ppmWaitTimeouts :: CounterVector PostgresPoolLabel
+  }
+
+-- | The pool a metric is about: a source's name, or "(metadata)" for the metadata database
+-- pool. Source names are not restricted, so a source can also be named "(metadata)", and
+-- its pool then adds to the same series as the metadata database pool.
+newtype PostgresPoolLabel = PostgresPoolLabel {_pplSourceName :: Text}
+  deriving stock (Eq, Ord)
+
+instance ToLabels PostgresPoolLabel where
+  toLabels (PostgresPoolLabel sourceName) = Map.singleton "source_name" sourceName
+
+data PostgresPoolClosedLabel = PostgresPoolClosedLabel
+  { _ppclPool :: PostgresPoolLabel,
+    _ppclReason :: Text
+  }
+  deriving stock (Eq, Ord)
+
+instance ToLabels PostgresPoolClosedLabel where
+  toLabels (PostgresPoolClosedLabel pool reason) = toLabels pool <> Map.singleton "reason" reason
+
+sourcePoolLabel :: SourceName -> PostgresPoolLabel
+sourcePoolLabel = PostgresPoolLabel . sourceNameToText
+
+metadataPoolLabel :: PostgresPoolLabel
+metadataPoolLabel = PostgresPoolLabel "(metadata)"
+
+-- | The pool observer that records a pool in the Postgres pool metrics, under its label.
+-- The counters and the waiting, in use and open gauges of the pool start at zero when it is
+-- created, so a pool that has not been used, or has had no errors, closes or timeouts, shows
+-- zero rather than a missing series.
+postgresPoolObserver :: PrometheusMetrics -> PostgresPoolLabel -> IO PGPoolObserver
+postgresPoolObserver PrometheusMetrics {pmPostgresPoolMetrics = PostgresPoolMetrics {..}} pool = do
+  CounterVector.add ppmConnectionErrors pool 0
+  for_ [PGConnectionClosedLifetime, PGConnectionClosedOther] \reason ->
+    CounterVector.add ppmConnectionsClosed (closedLabel reason) 0
+  CounterVector.add ppmWaitTimeouts pool 0
+  GaugeVector.add ppmWaitingRequests pool 0
+  GaugeVector.add ppmConnectionsInUse pool 0
+  GaugeVector.add ppmConnectionsOpen pool 0
+  pure
+    PGPoolObserver
+      { ppoWaitTime = HistogramVector.observe ppmWaitTime pool,
+        ppoRequestWaiting = GaugeVector.inc ppmWaitingRequests pool,
+        ppoRequestServed = GaugeVector.dec ppmWaitingRequests pool,
+        ppoWaitTimeout = CounterVector.inc ppmWaitTimeouts pool,
+        ppoConnectionTaken = GaugeVector.inc ppmConnectionsInUse pool,
+        ppoConnectionReturned = GaugeVector.dec ppmConnectionsInUse pool,
+        ppoMaxConnections = GaugeVector.set ppmMaxConnections pool . fromIntegral,
+        -- The pool reports the time of every connection it opens, so that is where one opens.
+        ppoConnectionInitTime = \seconds -> do
+          HistogramVector.observe ppmConnectionInitTime pool seconds
+          GaugeVector.inc ppmConnectionsOpen pool,
+        ppoConnectionError = CounterVector.inc ppmConnectionErrors pool,
+        ppoConnectionClosed = \reason -> do
+          GaugeVector.dec ppmConnectionsOpen pool
+          CounterVector.inc ppmConnectionsClosed $ closedLabel reason
+      }
+  where
+    closedLabel reason = PostgresPoolClosedLabel pool $ case reason of
+      PGConnectionClosedLifetime -> "lifetime"
+      PGConnectionClosedOther -> "other"
 
 data GraphQLRequestMetrics = GraphQLRequestMetrics
   { gqlRequests :: CounterVector GraphQLRequestsLabels,
@@ -214,8 +298,22 @@ makeDummyPrometheusMetrics = do
   pmWebsocketMsgDropped <- Counter.new
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
+  pmPostgresPoolMetrics <- makeDummyPostgresPoolMetrics
   let pmSample = pure mempty
   pure PrometheusMetrics {..}
+
+makeDummyPostgresPoolMetrics :: IO PostgresPoolMetrics
+makeDummyPostgresPoolMetrics = do
+  ppmWaitTime <- HistogramVector.new []
+  ppmWaitingRequests <- GaugeVector.new
+  ppmConnectionsInUse <- GaugeVector.new
+  ppmConnectionsOpen <- GaugeVector.new
+  ppmMaxConnections <- GaugeVector.new
+  ppmConnectionInitTime <- HistogramVector.new []
+  ppmConnectionErrors <- CounterVector.new
+  ppmConnectionsClosed <- CounterVector.new
+  ppmWaitTimeouts <- CounterVector.new
+  pure PostgresPoolMetrics {..}
 
 makeDummyGraphQLRequestMetrics :: IO GraphQLRequestMetrics
 makeDummyGraphQLRequestMetrics = do
@@ -760,6 +858,60 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Total number of messages enqueued for sending over a websocket connection"
       'CounterType
       ()
+  PostgresPoolWaitTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_wait_time_seconds"
+      "Time spent waiting for a connection from the Postgres pool, in seconds"
+      'HistogramType
+      PostgresPoolLabel
+  PostgresPoolWaitingRequests ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_waiting_requests"
+      "Current number of requests waiting for a Postgres pool connection"
+      'GaugeType
+      PostgresPoolLabel
+  PostgresPoolConnectionsInUse ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_connections_in_use"
+      "Current number of Postgres pool connections in use"
+      'GaugeType
+      PostgresPoolLabel
+  PostgresPoolConnectionsOpen ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_connections_open"
+      "Current number of open Postgres pool connections"
+      'GaugeType
+      PostgresPoolLabel
+  PostgresPoolMaxConnections ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_max_connections"
+      "Maximum number of connections in the Postgres pool"
+      'GaugeType
+      PostgresPoolLabel
+  PostgresConnectionInitTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_postgres_connection_init_time_seconds"
+      "Time taken to open a new Postgres connection, in seconds"
+      'HistogramType
+      PostgresPoolLabel
+  PostgresConnectionErrorsTotal ::
+    PrometheusMetricsSpec
+      "hasura_postgres_connection_errors_total"
+      "Total number of failed attempts to open a Postgres connection"
+      'CounterType
+      PostgresPoolLabel
+  PostgresConnectionsClosedTotal ::
+    PrometheusMetricsSpec
+      "hasura_postgres_connections_closed_total"
+      "Total number of Postgres connections closed by the pool"
+      'CounterType
+      PostgresPoolClosedLabel
+  PostgresPoolWaitTimeoutsTotal ::
+    PrometheusMetricsSpec
+      "hasura_postgres_pool_wait_timeouts_total"
+      "Total number of requests that timed out waiting for a Postgres pool connection"
+      'CounterType
+      PostgresPoolLabel
   WebsocketMessagesDroppedTotal ::
     PrometheusMetricsSpec
       "hasura_websocket_messages_dropped_total"
@@ -811,8 +963,22 @@ makePrometheusMetrics store = do
   -- edition code, so they are not registered to the store.
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
+  pmPostgresPoolMetrics <- makePostgresPoolMetrics store
   let pmSample = sampleAll store
   pure PrometheusMetrics {..}
+
+makePostgresPoolMetrics :: Store PrometheusMetricsSpec -> IO PostgresPoolMetrics
+makePostgresPoolMetrics store = do
+  ppmWaitTime <- createHistogramVector subscriptionTimeBuckets PostgresPoolWaitTimeSeconds store OrdMap.toList
+  ppmWaitingRequests <- createGaugeVector PostgresPoolWaitingRequests store OrdMap.toList
+  ppmConnectionsInUse <- createGaugeVector PostgresPoolConnectionsInUse store OrdMap.toList
+  ppmConnectionsOpen <- createGaugeVector PostgresPoolConnectionsOpen store OrdMap.toList
+  ppmMaxConnections <- createGaugeVector PostgresPoolMaxConnections store OrdMap.toList
+  ppmConnectionInitTime <- createHistogramVector subscriptionTimeBuckets PostgresConnectionInitTimeSeconds store OrdMap.toList
+  ppmConnectionErrors <- createCounterVector PostgresConnectionErrorsTotal store OrdMap.toList
+  ppmConnectionsClosed <- createCounterVector PostgresConnectionsClosedTotal store OrdMap.toList
+  ppmWaitTimeouts <- createCounterVector PostgresPoolWaitTimeoutsTotal store OrdMap.toList
+  pure PostgresPoolMetrics {..}
 
 makeGraphQLRequestMetrics :: Store PrometheusMetricsSpec -> IO GraphQLRequestMetrics
 makeGraphQLRequestMetrics store = do

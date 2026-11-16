@@ -69,8 +69,7 @@ Behavior and configuration:
   upstream `Main.hs` via `EKG.registerGcMetrics`). They are deliberately not registered to
   the Prometheus store as well, to keep one family per name.
 - Metric fields that are never incremented by community edition code
-  (`hasura_cache_request_count`, `hasura_otel_*`) are not registered. Postgres connection
-  pool metrics are not exported in this phase.
+  (`hasura_cache_request_count`, `hasura_otel_*`) are not registered.
 
 Exported metric families (names, labels, buckets) are defined in `PrometheusMetricsSpec`
 (`server/src-lib/Hasura/Server/Prometheus.hs`) and pinned by the golden test
@@ -166,6 +165,48 @@ operation it belongs to is cancelled (`cancelOperationOnOvercapacity` in
 said the message was dropped; it now says it was rejected and that each rejection cancels
 its operation. The metric name is unchanged.
 
+## Postgres pool metrics
+
+The bundled `pg-client` kept a few pool metrics of its own (wait and connection open
+times, an error counter) that nothing exported. A pool now takes a `PGPoolObserver`, a
+record of functions it calls as it serves and manages connections
+(`initPGPoolWithObserver`; `initPGPool` passes one that records nothing), and the engine
+builds one per pool from labeled vectors in its Prometheus metrics
+(`postgresPoolObserver`). There is no registry of live pools: a pool recreated for the same
+source keeps adding to the same series.
+
+- Pools observed: every Postgres source pool (`mkPgSourceResolver`), labeled with the
+  source name, and the metadata database pool, labeled `(metadata)`. Both go through the
+  same `initPGPoolWithObserver`. The one-off minimal pools (version checks, downgrade) are
+  not observed. Source names are not restricted (the metadata API accepts a source named
+  `(metadata)`), so a source with that name adds to the same series as the metadata pool.
+- Metrics, all with the `source_name` label: `hasura_postgres_pool_wait_time_seconds`,
+  `hasura_postgres_pool_waiting_requests`, `hasura_postgres_pool_connections_in_use`,
+  `hasura_postgres_pool_connections_open` (up when the pool opens a connection, down when it
+  closes one),
+  `hasura_postgres_pool_max_connections`, `hasura_postgres_connection_init_time_seconds`,
+  `hasura_postgres_connection_errors_total`,
+  `hasura_postgres_connections_closed_total{reason}` and
+  `hasura_postgres_pool_wait_timeouts_total`. The three counters and the waiting, in use
+  and open gauges of a pool start at zero when its observer is created, so a pool that has
+  not been used, or has had no errors, closes or timeouts, shows zero rather than a missing
+  series.
+- `hasura_postgres_pool_max_connections` is the most connections the pool can have open:
+  the bundled `resource-pool` applies the configured limit to each stripe, so it is the
+  limit times the number of stripes, on creation and after every resize.
+- The wait (`hasura_postgres_pool_wait_time_seconds`) is observed only when a request gets
+  a connection. It includes opening a new connection when the pool grows to serve the
+  request, and a request whose connection is discarded for being past its lifetime waits
+  again, so it is observed twice. A request that gives up when the pool's timeout
+  (`cpTimeout`, which the pool rounds to whole seconds) expires is not observed in the wait
+  and is counted in `hasura_postgres_pool_wait_timeouts_total` instead.
+- `reason` is `lifetime` when the connection was older than the configured lifetime when
+  it was closed, the same age test `withExpiringPGconn` uses to discard it, and `other`
+  otherwise. It is a test of age, not of why the connection was closed: one past its
+  lifetime that is closed for being idle, after an error or when the pool is destroyed
+  also counts as `lifetime`. The bundled `resource-pool` is not changed, so the cause of a
+  close cannot be told apart.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -232,5 +273,14 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/src-lib/Hasura/Server/Prometheus.hs`: also changes the help of
   `hasura_websocket_messages_dropped_total` (see "Help of the full send queue counter"
   above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs`.
+- `server/lib/pg-client/src/Database/PG/Query/Pool.hs`: adds the pool observer (see
+  "Postgres pool metrics" above).
+- `server/src-lib/Hasura/App.hs`: observes the metadata pool and every Postgres source pool.
+- `server/src-lib/Hasura/Server/Prometheus.hs`: also adds the Postgres pool metrics and
+  `postgresPoolObserver`, tested in `server/src-test/Hasura/Server/PrometheusSpec.hs`.
+- `server/test-postgres/Test/Hasura/PostgresPoolSuite.hs` (new file) and
+  `server/test-postgres/Main.hs`: test the pool observer against a real database; `Main`
+  passes the metrics to the source resolver.
+- `server/graphql-engine.cabal`: also registers the new test module.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

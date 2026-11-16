@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- adds a pool observer, so the engine can record how each pool serves and manages its
+-- connections in its Prometheus metrics. See BBB-CHANGES.md.
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -18,6 +21,10 @@ module Database.PG.Query.Pool
     getMaxConnections,
     defaultConnParams,
     initPGPool,
+    PGPoolObserver (..),
+    PGConnectionCloseReason (..),
+    noPGPoolObserver,
+    initPGPoolWithObserver,
     resizePGPool,
     destroyPGPool,
     withConn,
@@ -46,7 +53,7 @@ import Control.Monad.Trans.Except (ExceptT)
 import Data.Aeson (ToJSON (toJSON), Value)
 import Data.ByteString qualified as BS
 import Data.HashTable.IO qualified as HIO
-import Data.IORef (newIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Pool qualified as RP
 import Data.String (fromString)
 import Data.Text qualified as Text
@@ -73,8 +80,57 @@ data PGPool = PGPool
     -- | EKG stats about how we acquire, release, and manage connections
     _stats :: !PGPoolStats,
     -- | Prometheus metrics about how we acquire, release, and manage connections
-    _metrics :: !PGPoolMetrics
+    _metrics :: !PGPoolMetrics,
+    -- | Observation functions the pool calls as it serves and manages connections
+    _observer :: !PGPoolObserver
   }
+
+-- | Why a connection was closed: it was older than the configured lifetime, or anything else
+-- (idle timeout, error, the pool being destroyed or trimmed).
+data PGConnectionCloseReason = PGConnectionClosedLifetime | PGConnectionClosedOther
+  deriving stock (Eq, Show)
+
+-- | Functions a pool calls to report how it serves and manages connections, so a caller can
+-- record them in its own metrics (one set of functions per pool, typically per source).
+data PGPoolObserver = PGPoolObserver
+  { -- | seconds a request waited for a connection from the pool
+    ppoWaitTime :: Double -> IO (),
+    -- | a request starts waiting for a connection
+    ppoRequestWaiting :: IO (),
+    -- | a request stops waiting, with a connection or without one
+    ppoRequestServed :: IO (),
+    -- | a request gave up waiting for a connection when the pool's timeout ('cpTimeout') expired
+    ppoWaitTimeout :: IO (),
+    -- | a connection is taken from the pool
+    ppoConnectionTaken :: IO (),
+    -- | a connection taken from the pool is returned (or discarded)
+    ppoConnectionReturned :: IO (),
+    -- | the maximum number of connections the pool can have open, on creation and on every
+    -- resize: the limit is per stripe, so this is the limit times the number of stripes
+    ppoMaxConnections :: Int -> IO (),
+    -- | seconds taken to open and initialise a new connection
+    ppoConnectionInitTime :: Double -> IO (),
+    -- | a new connection could not be opened
+    ppoConnectionError :: IO (),
+    -- | a connection was closed
+    ppoConnectionClosed :: PGConnectionCloseReason -> IO ()
+  }
+
+-- | A pool observer that records nothing.
+noPGPoolObserver :: PGPoolObserver
+noPGPoolObserver =
+  PGPoolObserver
+    { ppoWaitTime = const (pure ()),
+      ppoRequestWaiting = pure (),
+      ppoRequestServed = pure (),
+      ppoWaitTimeout = pure (),
+      ppoConnectionTaken = pure (),
+      ppoConnectionReturned = pure (),
+      ppoMaxConnections = const (pure ()),
+      ppoConnectionInitTime = const (pure ()),
+      ppoConnectionError = pure (),
+      ppoConnectionClosed = const (pure ())
+    }
 
 pgPoolStats :: PGPool -> PGPoolStats
 pgPoolStats = _stats
@@ -144,10 +200,21 @@ initPGPool ::
   ConnParams ->
   PGLogger ->
   IO PGPool
-initPGPool ci context cp logger = do
+initPGPool = initPGPoolWithObserver noPGPoolObserver
+
+-- | 'initPGPool', reporting to the given observer how the pool serves and manages connections.
+initPGPoolWithObserver ::
+  PGPoolObserver ->
+  ConnInfo ->
+  Value ->
+  ConnParams ->
+  PGLogger ->
+  IO PGPool
+initPGPoolWithObserver _observer ci context cp logger = do
   _stats <- initPGPoolStats
   _metrics <- initPGPoolMetrics
   _pool <- RP.createPool' (creator _stats _metrics) destroyer nStripes diffTime nConns nTimeout
+  ppoMaxConnections _observer (nStripes * nConns)
   pure PGPool {..}
   where
     nStripes = cpStripes cp
@@ -156,16 +223,22 @@ initPGPool ci context cp logger = do
     retryP = mkPGRetryPolicy $ ciRetries ci
     creator stats metrics = do
       createdAt <- getCurrentTime
-      pqConn <- (initPQConn ci logger) `Exc.onException` (Counter.inc (_pgErrorTotalMetric metrics))
+      pqConn <- (initPQConn ci logger) `Exc.onException` (Counter.inc (_pgErrorTotalMetric metrics) >> ppoConnectionError _observer)
       connAcquiredAt <- getCurrentTime
       let connAcquiredMicroseconds = realToFrac (1000000 * diffUTCTime connAcquiredAt createdAt)
           connAcquiredSeconds = realToFrac $ diffUTCTime connAcquiredAt createdAt
       EKG.Distribution.add (_dbConnAcquireLatency stats) connAcquiredMicroseconds
       Histogram.observe (_pgConnAcquireLatencyMetric metrics) connAcquiredSeconds
+      ppoConnectionInitTime _observer connAcquiredSeconds
       ctr <- newIORef 0
       table <- HIO.new
       return $ PGConn context pqConn (cpAllowPrepare cp) (cpCancel cp) retryP logger ctr table createdAt (cpMbLifetime cp)
-    destroyer = PQ.finish . pgPQConn
+    destroyer conn = do
+      -- The same test 'withExpiringPGconn' uses to discard a connection as stale.
+      now <- getCurrentTime
+      let pastLifetime = any (\lifetime -> now `diffUTCTime` pgCreatedAt conn > lifetime) (pgMbLifetime conn)
+      PQ.finish (pgPQConn conn)
+      ppoConnectionClosed _observer (if pastLifetime then PGConnectionClosedLifetime else PGConnectionClosedOther)
     diffTime = fromIntegral $ cpIdleTime cp
 
 resizePGPool ::
@@ -174,6 +247,7 @@ resizePGPool ::
   IO ()
 resizePGPool PGPool {..} size = do
   RP.resizePool _pool size
+  ppoMaxConnections _observer (RP.numStripes _pool * size)
   RP.tryTrimPool _pool
 
 -- | Release all connections acquired by the pool.
@@ -348,21 +422,38 @@ withExpiringPGconn pool f = do
   -- If the connection was stale, we'll discard it and retry, possibly forcing
   -- creation of new connection:
   old <- liftIO getCurrentTime
+  let observer = _observer pool
   handleLifted (\PGConnectionStale -> withExpiringPGconn pool f) $ do
-    RP.withResource (_pool pool) $ \connRsrc@PGConn {..} -> do
-      now <- liftIO getCurrentTime
-      let microseconds = realToFrac (1000000 * diffUTCTime now old)
-          seconds = realToFrac $ diffUTCTime now old
-      liftIO (EKG.Distribution.add (_poolConnAcquireLatency (_stats pool)) microseconds)
-      liftIO (Histogram.observe (_poolWaitTimeMetric (_metrics pool)) seconds)
-      let connectionStale =
-            any (\lifetime -> now `diffUTCTime` pgCreatedAt > lifetime) pgMbLifetime
-      when connectionStale $ do
-        -- Throwing is the only way to signal to resource pool to discard the
-        -- connection at this time, so we need to use it for control flow:
-        Exc.impureThrow PGConnectionStale
-      -- else proceed with callback:
-      f connRsrc
+    -- The request waits until it gets a connection, or until taking one fails.
+    stillWaiting <- liftIO $ newIORef True
+    let served = do
+          wasWaiting <- atomicModifyIORef' stillWaiting (\w -> (False, w))
+          when wasWaiting $ ppoRequestServed observer
+        -- Caught before 'served' runs, so a request that is still waiting is one that never
+        -- got a connection.
+        countWaitTimeout action = control $ \runInIO ->
+          runInIO action `Exc.catch` \RP.TimeoutException -> do
+            timedOutWaiting <- readIORef stillWaiting
+            when timedOutWaiting $ ppoWaitTimeout observer
+            Exc.throwIO RP.TimeoutException
+    bracketLifted_ (ppoRequestWaiting observer) served $ countWaitTimeout $ do
+      RP.withResource (_pool pool) $ \connRsrc@PGConn {..} -> do
+        liftIO served
+        now <- liftIO getCurrentTime
+        let microseconds = realToFrac (1000000 * diffUTCTime now old)
+            seconds = realToFrac $ diffUTCTime now old
+        liftIO (EKG.Distribution.add (_poolConnAcquireLatency (_stats pool)) microseconds)
+        liftIO (Histogram.observe (_poolWaitTimeMetric (_metrics pool)) seconds)
+        liftIO (ppoWaitTime observer seconds)
+        bracketLifted_ (ppoConnectionTaken observer) (ppoConnectionReturned observer) $ do
+          let connectionStale =
+                any (\lifetime -> now `diffUTCTime` pgCreatedAt > lifetime) pgMbLifetime
+          when connectionStale $ do
+            -- Throwing is the only way to signal to resource pool to discard the
+            -- connection at this time, so we need to use it for control flow:
+            Exc.impureThrow PGConnectionStale
+          -- else proceed with callback:
+          f connRsrc
 
 -- | Used internally (see 'withExpiringPGconn'), but exported in case we need
 -- to allow callback to signal that the connection should be destroyed and we
@@ -370,6 +461,12 @@ withExpiringPGconn pool f = do
 data PGConnectionStale = PGConnectionStale
   deriving stock (Show)
   deriving anyclass (Exception)
+
+-- | Run the first action, then the computation, then the second action even if the
+-- computation throws.
+bracketLifted_ :: (MonadBaseControl IO m) => IO () -> IO () -> m a -> m a
+bracketLifted_ before after ma = control $ \runInIO ->
+  Exc.bracket_ before after (runInIO ma)
 
 -- cribbed from lifted-base
 handleLifted :: (MonadBaseControl IO m, Exception e) => (e -> m a) -> m a -> m a

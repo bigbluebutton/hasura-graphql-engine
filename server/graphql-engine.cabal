@@ -1322,5 +1322,6 @@ test-suite graphql-engine-test-postgres
   other-modules:
     Constants
     Test.Hasura.EventTriggerCleanupSuite
+    Test.Hasura.PostgresPoolSuite
     Test.Hasura.StreamingSubscriptionSuite
     Test.Hasura.Server.MigrateSuite

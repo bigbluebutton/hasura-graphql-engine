@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- passes the Prometheus metrics to the Postgres source resolver and runs the Postgres pool
+-- suite. See BBB-CHANGES.md.
 {-# LANGUAGE UndecidableInstances #-}
 
 module Main (main) where
@@ -49,6 +52,7 @@ import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
 import System.Metrics qualified as EKG
 import Test.Hasura.EventTriggerCleanupSuite qualified as EventTriggerCleanupSuite
+import Test.Hasura.PostgresPoolSuite qualified as PostgresPoolSuite
 import Test.Hasura.Server.MigrateSuite qualified as MigrateSuite
 import Test.Hasura.StreamingSubscriptionSuite qualified as StreamingSubscriptionSuite
 import Test.Hspec
@@ -133,7 +137,7 @@ main = do
                 ApolloFederationDisabled
                 (_default closeWebsocketsOnMetadataChangeOption)
                 RelayModeEnabled
-            cacheBuildParams = CacheBuildParams httpManager (mkPgSourceResolver print) mkMSSQLSourceResolver staticConfig
+            cacheBuildParams = CacheBuildParams httpManager (mkPgSourceResolver prometheusMetrics print) mkMSSQLSourceResolver staticConfig
 
         (_appInit, appEnv) <-
           lowerManagedT
@@ -173,6 +177,7 @@ main = do
       $ MigrateSuite.suite sourceConfig pgContext pgConnInfo
     describe "Streaming subscription suite" $ streamingSubscriptionSuite
     describe "Event trigger log cleanup suite" $ eventTriggerLogCleanupSuite
+    describe "Postgres pool suite" $ PostgresPoolSuite.suite pgConnInfo
 
 printErrExit :: String -> IO a
 printErrExit = (*> exitFailure) . putStrLn

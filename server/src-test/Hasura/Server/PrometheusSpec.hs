@@ -20,6 +20,7 @@ import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Database.PG.Query qualified as PG
 import Hasura.GraphQL.ParameterizedQueryHash (mkUnsafeParameterizedQueryHash)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
@@ -42,6 +43,94 @@ spec = do
   recordSubscriptionMetricSpec
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
+  postgresPoolObserverSpec
+
+-- | The observer of a pool records under the pool's label: "(metadata)" or the source name.
+postgresPoolObserverSpec :: Spec
+postgresPoolObserverSpec = describe "postgresPoolObserver" $ do
+  it "starts the pool's counters and its waiting, in use and open gauges at zero" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    _ <- postgresPoolObserver metrics (PostgresPoolLabel "default")
+    rendered <- renderSample metrics
+    sort [line | line <- T.lines rendered, "hasura_postgres_" `T.isPrefixOf` line]
+      `shouldBe` sort
+        [ "hasura_postgres_connection_errors_total{source_name=\"default\"} 0.0",
+          "hasura_postgres_connections_closed_total{source_name=\"default\",reason=\"lifetime\"} 0.0",
+          "hasura_postgres_connections_closed_total{source_name=\"default\",reason=\"other\"} 0.0",
+          "hasura_postgres_pool_connections_in_use{source_name=\"default\"} 0.0",
+          "hasura_postgres_pool_connections_open{source_name=\"default\"} 0.0",
+          "hasura_postgres_pool_wait_timeouts_total{source_name=\"default\"} 0.0",
+          "hasura_postgres_pool_waiting_requests{source_name=\"default\"} 0.0"
+        ]
+
+  it "records each pool event under the pool's source_name" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observer <- postgresPoolObserver metrics metadataPoolLabel
+    PG.ppoMaxConnections observer 50
+    PG.ppoRequestWaiting observer
+    PG.ppoRequestServed observer
+    PG.ppoWaitTimeout observer
+    PG.ppoConnectionTaken observer
+    PG.ppoWaitTime observer 0.2
+    PG.ppoConnectionInitTime observer 0.01
+    PG.ppoConnectionInitTime observer 0.01
+    PG.ppoConnectionInitTime observer 0.01
+    PG.ppoConnectionError observer
+    PG.ppoConnectionClosed observer PG.PGConnectionClosedLifetime
+    PG.ppoConnectionClosed observer PG.PGConnectionClosedOther
+    PG.ppoConnectionClosed observer PG.PGConnectionClosedOther
+    rendered <- renderSample metrics
+    let poolLines =
+          sort
+            [ line
+            | line <- T.lines rendered,
+              "hasura_postgres_" `T.isPrefixOf` line,
+              not ("_bucket{" `T.isInfixOf` line)
+            ]
+    poolLines
+      `shouldBe` sort
+        [ "hasura_postgres_connection_errors_total{source_name=\"(metadata)\"} 1.0",
+          "hasura_postgres_connection_init_time_seconds_count{source_name=\"(metadata)\"} 3",
+          "hasura_postgres_connection_init_time_seconds_sum{source_name=\"(metadata)\"} 3.0e-2",
+          "hasura_postgres_pool_connections_open{source_name=\"(metadata)\"} 0.0",
+          "hasura_postgres_connections_closed_total{source_name=\"(metadata)\",reason=\"lifetime\"} 1.0",
+          "hasura_postgres_connections_closed_total{source_name=\"(metadata)\",reason=\"other\"} 2.0",
+          "hasura_postgres_pool_connections_in_use{source_name=\"(metadata)\"} 1.0",
+          "hasura_postgres_pool_max_connections{source_name=\"(metadata)\"} 50.0",
+          "hasura_postgres_pool_wait_time_seconds_count{source_name=\"(metadata)\"} 1",
+          "hasura_postgres_pool_wait_time_seconds_sum{source_name=\"(metadata)\"} 0.2",
+          "hasura_postgres_pool_waiting_requests{source_name=\"(metadata)\"} 0.0",
+          "hasura_postgres_pool_wait_timeouts_total{source_name=\"(metadata)\"} 1.0"
+        ]
+
+  it "counts a waiting request and a connection in use up while they last, and down after" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observer <- postgresPoolObserver metrics metadataPoolLabel
+    let gauges = do
+          rendered <- renderSample metrics
+          pure
+            $ sort
+              [ line
+              | line <- T.lines rendered,
+                any (`T.isPrefixOf` line) ["hasura_postgres_pool_waiting_requests", "hasura_postgres_pool_connections_in_use"]
+              ]
+    PG.ppoRequestWaiting observer
+    PG.ppoConnectionTaken observer
+    during <- gauges
+    PG.ppoRequestServed observer
+    PG.ppoConnectionReturned observer
+    after <- gauges
+    during
+      `shouldBe` [ "hasura_postgres_pool_connections_in_use{source_name=\"(metadata)\"} 1.0",
+                   "hasura_postgres_pool_waiting_requests{source_name=\"(metadata)\"} 1.0"
+                 ]
+    after
+      `shouldBe` [ "hasura_postgres_pool_connections_in_use{source_name=\"(metadata)\"} 0.0",
+                   "hasura_postgres_pool_waiting_requests{source_name=\"(metadata)\"} 0.0"
+                 ]
 
 dbExecutionTimeHelpSpec :: Spec
 dbExecutionTimeHelpSpec = describe "hasura_subscription_db_execution_time_seconds" $ do
@@ -141,6 +230,16 @@ observeEveryVectorOnce metrics = do
   HistogramVector.observe (submDBExecTotalTime subm) subLabel 0.1
   GaugeVector.inc (submActiveSubscriptions subm) subLabel
   CounterVector.inc (pmWebSocketBytesSent metrics) (DynamicGraphqlOperationLabel Nothing Nothing)
+  let pool = pmPostgresPoolMetrics metrics
+  HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
+  GaugeVector.inc (ppmWaitingRequests pool) metadataPoolLabel
+  GaugeVector.inc (ppmConnectionsInUse pool) metadataPoolLabel
+  GaugeVector.inc (ppmConnectionsOpen pool) metadataPoolLabel
+  GaugeVector.inc (ppmMaxConnections pool) metadataPoolLabel
+  HistogramVector.observe (ppmConnectionInitTime pool) metadataPoolLabel 0.1
+  CounterVector.inc (ppmConnectionErrors pool) metadataPoolLabel
+  CounterVector.inc (ppmConnectionsClosed pool) (PostgresPoolClosedLabel metadataPoolLabel "other")
+  CounterVector.inc (ppmWaitTimeouts pool) metadataPoolLabel
 
 -- | Every metric family 'makePrometheusMetrics' registers: scalar and
 -- statically labeled metrics appear in a fresh store, vector metrics after
@@ -171,6 +270,15 @@ expectedTypeLines =
       "# TYPE hasura_graphql_requests_total counter",
       "# TYPE hasura_http_connections gauge",
       "# TYPE hasura_oneoff_events_invocation_total counter",
+      "# TYPE hasura_postgres_connection_errors_total counter",
+      "# TYPE hasura_postgres_connection_init_time_seconds histogram",
+      "# TYPE hasura_postgres_connections_closed_total counter",
+      "# TYPE hasura_postgres_pool_connections_in_use gauge",
+      "# TYPE hasura_postgres_pool_connections_open gauge",
+      "# TYPE hasura_postgres_pool_max_connections gauge",
+      "# TYPE hasura_postgres_pool_wait_time_seconds histogram",
+      "# TYPE hasura_postgres_pool_wait_timeouts_total counter",
+      "# TYPE hasura_postgres_pool_waiting_requests gauge",
       "# TYPE hasura_oneoff_events_processed_total counter",
       "# TYPE hasura_scheduled_trigger_bytes_received_total counter",
       "# TYPE hasura_scheduled_trigger_bytes_sent_total counter",

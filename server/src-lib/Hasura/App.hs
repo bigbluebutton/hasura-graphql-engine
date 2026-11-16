@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- records the metadata pool and every Postgres source pool in the Postgres pool metrics. See
+-- BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE UndecidableInstances #-}
@@ -154,6 +157,9 @@ import Hasura.Server.Prometheus
   ( PrometheusMetrics (..),
     decWarpThreads,
     incWarpThreads,
+    metadataPoolLabel,
+    postgresPoolObserver,
+    sourcePoolLabel,
   )
 import Hasura.Server.RemoteSchemaHealing (startRemoteSchemaHealingThread)
 import Hasura.Server.ResourceChecker (getServerResources)
@@ -444,7 +450,10 @@ initialiseAppEnv BasicConnectionInfo {..} serveOptions@ServeOptions {..} liveQue
   -- Init metadata db pool.
   metadataDbPool <-
     allocate
-      (liftIO $ PG.initPGPool bciMetadataConnInfo connectionContext soConnParams pgLogger)
+      ( liftIO $ do
+          observer <- postgresPoolObserver prometheusMetrics metadataPoolLabel
+          PG.initPGPoolWithObserver observer bciMetadataConnInfo connectionContext soConnParams pgLogger
+      )
       (liftIO . PG.destroyPGPool)
 
   -- Migrate the catalog and fetch the metdata.
@@ -575,7 +584,7 @@ initialiseAppContext env serveOptions AppInit {..} = do
       (soDisableNativeQueryValidation serveOptions)
       env
       logger
-      (mkPgSourceResolver pgLogger)
+      (mkPgSourceResolver appEnvPrometheusMetrics pgLogger)
       mkMSSQLSourceResolver
       aiMetadataWithResourceVersion
       cacheStaticConfig
@@ -826,7 +835,7 @@ instance WS.MonadWSLog AppM where
   logWSLog logger = unLoggerTracing logger
 
 instance MonadResolveSource AppM where
-  getPGSourceResolver = asks (mkPgSourceResolver . _lsPgLogger . appEnvLoggers)
+  getPGSourceResolver = asks \appEnv -> mkPgSourceResolver (appEnvPrometheusMetrics appEnv) (_lsPgLogger (appEnvLoggers appEnv))
   getMSSQLSourceResolver = return mkMSSQLSourceResolver
 
 instance MonadQueryTags AppM where
@@ -1561,8 +1570,9 @@ telemetryNotice =
     <> "usage stats which allows us to keep improving Hasura at warp speed. "
     <> "To read more or opt-out, visit https://hasura.io/docs/latest/graphql/core/guides/telemetry.html"
 
-mkPgSourceResolver :: PG.PGLogger -> SourceResolver ('Postgres 'Vanilla)
-mkPgSourceResolver pgLogger env sourceName config = runExceptT do
+-- | Resolves a Postgres source, recording its pool in the Postgres pool metrics.
+mkPgSourceResolver :: PrometheusMetrics -> PG.PGLogger -> SourceResolver ('Postgres 'Vanilla)
+mkPgSourceResolver prometheusMetrics pgLogger env sourceName config = runExceptT do
   let PostgresSourceConnInfo urlConf poolSettings allowPrepare isoLevel _ = pccConnectionInfo config
   -- If the user does not provide values for the pool settings, then use the default values
   let (maxConns, idleTimeout, retries, connLifetime) = getDefaultPGPoolSettingIfNotExists poolSettings defaultPostgresPoolSettings
@@ -1577,7 +1587,8 @@ mkPgSourceResolver pgLogger env sourceName config = runExceptT do
             PG.cpTimeout = ppsPoolTimeout =<< poolSettings
           }
   let context = J.object [("source" J..= sourceName)]
-  pgPool <- liftIO $ Q.initPGPool connInfo context connParams pgLogger
+  observer <- liftIO $ postgresPoolObserver prometheusMetrics (sourcePoolLabel sourceName)
+  pgPool <- liftIO $ Q.initPGPoolWithObserver observer connInfo context connParams pgLogger
   let pgExecCtx = mkPGExecCtx isoLevel pgPool NeverResizePool
   connInfoWithFinalizer <- liftIO $ mkConnInfoWithFinalizer connInfo (pure ())
   pure $ PGSourceConfig pgExecCtx connInfoWithFinalizer Nothing mempty (pccExtensionsSchema config) mempty ConnTemplate_NotApplicable
