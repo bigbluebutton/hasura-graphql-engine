@@ -1,12 +1,12 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds a metric specification and a store-backed constructor for the Prometheus metrics,
--- used by the GET /v1/metrics endpoint; observes a subscription poll once when granular
--- metrics are off; says in the help of the subscription database time that the pool wait is
--- left out; describes what a full websocket send queue does in the help of its counter;
--- adds the Postgres pool metrics and the pool observer that records them. See BBB-
--- CHANGES.md.
+-- adds a metric specification and a store-backed constructor for the Prometheus
+-- metrics, used by the GET /v1/metrics endpoint; observes a subscription poll once when
+-- granular metrics are off; sets the buckets of the subscription poll times; says in the
+-- help of the subscription database time that the pool wait is left out; describes what a
+-- full websocket send queue does in the help of its counter; adds the Postgres pool
+-- metrics and the pool observer that records them. See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -969,12 +969,12 @@ makePrometheusMetrics store = do
 
 makePostgresPoolMetrics :: Store PrometheusMetricsSpec -> IO PostgresPoolMetrics
 makePostgresPoolMetrics store = do
-  ppmWaitTime <- createHistogramVector subscriptionTimeBuckets PostgresPoolWaitTimeSeconds store OrdMap.toList
+  ppmWaitTime <- createHistogramVector pollAndPoolTimeBuckets PostgresPoolWaitTimeSeconds store OrdMap.toList
   ppmWaitingRequests <- createGaugeVector PostgresPoolWaitingRequests store OrdMap.toList
   ppmConnectionsInUse <- createGaugeVector PostgresPoolConnectionsInUse store OrdMap.toList
   ppmConnectionsOpen <- createGaugeVector PostgresPoolConnectionsOpen store OrdMap.toList
   ppmMaxConnections <- createGaugeVector PostgresPoolMaxConnections store OrdMap.toList
-  ppmConnectionInitTime <- createHistogramVector subscriptionTimeBuckets PostgresConnectionInitTimeSeconds store OrdMap.toList
+  ppmConnectionInitTime <- createHistogramVector pollAndPoolTimeBuckets PostgresConnectionInitTimeSeconds store OrdMap.toList
   ppmConnectionErrors <- createCounterVector PostgresConnectionErrorsTotal store OrdMap.toList
   ppmConnectionsClosed <- createCounterVector PostgresConnectionsClosedTotal store OrdMap.toList
   ppmWaitTimeouts <- createCounterVector PostgresPoolWaitTimeoutsTotal store OrdMap.toList
@@ -1033,9 +1033,9 @@ makeSubscriptionMetrics store = do
   submActiveStreamingPollersInError <-
     createGauge ActiveSubscriptionPollersInErrorState streamingSubscriptionLabel store
   submTotalTime <-
-    createHistogramVector subscriptionTimeBuckets SubscriptionTotalTimeSeconds store OrdMap.toList
+    createHistogramVector pollAndPoolTimeBuckets SubscriptionTotalTimeSeconds store OrdMap.toList
   submDBExecTotalTime <-
-    createHistogramVector subscriptionTimeBuckets SubscriptionDbExecutionTimeSeconds store OrdMap.toList
+    createHistogramVector pollAndPoolTimeBuckets SubscriptionDbExecutionTimeSeconds store OrdMap.toList
   submActiveSubscriptions <- createGaugeVector ActiveSubscriptions store OrdMap.toList
   pure SubscriptionMetrics {..}
 
@@ -1053,8 +1053,11 @@ eventProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
 eventWebhookProcessingTimeBuckets :: [Histogram.UpperBound]
 eventWebhookProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10]
 
-subscriptionTimeBuckets :: [Histogram.UpperBound]
-subscriptionTimeBuckets = [0.000001, 0.0001, 0.01, 0.1, 0.3, 1, 3, 10, 30, 100]
+-- | Buckets for the subscription poll times (total and database) and for the two Postgres
+-- pool times (the wait for a connection and opening a connection). They resolve the poll
+-- intervals in use (150 ms for streaming, 333 ms for live queries) and the range up to 30 s.
+pollAndPoolTimeBuckets :: [Histogram.UpperBound]
+pollAndPoolTimeBuckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.333, 0.5, 0.75, 1, 2.5, 5, 10, 30]
 
 websocketMessageTimeBuckets :: [Histogram.UpperBound]
 websocketMessageTimeBuckets = [0.000001, 0.0001, 0.01, 0.1, 0.3, 1, 3, 10, 30, 100]

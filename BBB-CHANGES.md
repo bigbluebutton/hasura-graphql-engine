@@ -157,6 +157,18 @@ with the exception.
 The help of `hasura_subscription_db_execution_time_seconds` says the pool wait is left
 out.
 
+## Subscription poll time buckets
+
+The two subscription poll time histograms,
+`hasura_subscription_total_time_seconds` and
+`hasura_subscription_db_execution_time_seconds`, used the buckets
+`[0.000001, 0.0001, 0.01, 0.1, 0.3, 1, 3, 10, 30, 100]`, which cannot tell a poll near
+the 150 ms streaming interval or the 333 ms live query interval from its neighbours.
+They now use `[0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.333, 0.5,
+0.75, 1, 2.5, 5, 10, 30]` (`pollAndPoolTimeBuckets`), as do the two Postgres pool time
+histograms, `hasura_postgres_pool_wait_time_seconds` and
+`hasura_postgres_connection_init_time_seconds`.
+
 ## Help of the full send queue counter
 
 When a connection's websocket send queue is full, the message is not sent and the
@@ -270,6 +282,10 @@ Every file below carries a modification notice at the top, as required by Apache
   database time of a subscription query that waits for a pool connection, of one that
   ends with a statement error or an exception, and of a poll batch that gets no
   connection.
+- `server/src-lib/Hasura/Server/Prometheus.hs`: also sets the buckets of the subscription
+  poll time and Postgres pool time histograms (see "Subscription poll time buckets" above),
+  tested in
+  `server/src-test/Hasura/Server/PrometheusSpec.hs`.
 - `server/src-lib/Hasura/Server/Prometheus.hs`: also changes the help of
   `hasura_websocket_messages_dropped_total` (see "Help of the full send queue counter"
   above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs`.

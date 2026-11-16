@@ -41,6 +41,7 @@ spec :: Spec
 spec = do
   makePrometheusMetricsSpec
   recordSubscriptionMetricSpec
+  pollAndPoolTimeBucketsSpec
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
   postgresPoolObserverSpec
@@ -150,6 +151,31 @@ messagesDroppedHelpSpec = describe "hasura_websocket_messages_dropped_total" $ d
     rendered <- renderSample metrics
     filter ("# HELP hasura_websocket_messages_dropped_total " `T.isPrefixOf`) (T.lines rendered)
       `shouldBe` ["# HELP hasura_websocket_messages_dropped_total Total number of messages rejected because the websocket send queue was full; each rejection cancels its operation"]
+
+-- | The upper bounds the store exports for the two subscription poll time histograms and
+-- the two Postgres pool time histograms.
+pollAndPoolTimeBucketsSpec :: Spec
+pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time buckets" $ do
+  it "are the full list, including 150 ms and 333 ms, for all four histograms" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observeEveryVectorOnce metrics
+    rendered <- renderSample metrics
+    let upperBoundsOf family =
+          [ T.takeWhile (/= '"') afterLe
+          | line <- T.lines rendered,
+            (family <> "_bucket{") `T.isPrefixOf` line,
+            let (_, rest) = T.breakOn "le=\"" line,
+            let afterLe = T.drop 4 rest
+          ]
+        expected = ["1.0e-3", "5.0e-3", "1.0e-2", "2.5e-2", "5.0e-2", "7.5e-2", "0.1", "0.15", "0.2", "0.25", "0.333", "0.5", "0.75", "1.0", "2.5", "5.0", "10.0", "30.0", "+Inf"]
+    for_
+      [ "hasura_subscription_total_time_seconds",
+        "hasura_subscription_db_execution_time_seconds",
+        "hasura_postgres_pool_wait_time_seconds",
+        "hasura_postgres_connection_init_time_seconds"
+      ]
+      \family -> (family, upperBoundsOf family) `shouldBe` (family, expected)
 
 -- | A subscription poll serving several operation names is observed once per
 -- name with granular metrics (each observation carries its name) and once
