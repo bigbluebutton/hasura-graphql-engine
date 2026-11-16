@@ -40,6 +40,7 @@ spec :: Spec
 spec = do
   makePrometheusMetricsSpec
   recordSubscriptionMetricSpec
+  messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
 
 dbExecutionTimeHelpSpec :: Spec
@@ -51,6 +52,15 @@ dbExecutionTimeHelpSpec = describe "hasura_subscription_db_execution_time_second
     rendered <- renderSample metrics
     filter ("# HELP hasura_subscription_db_execution_time_seconds " `T.isPrefixOf`) (T.lines rendered)
       `shouldBe` ["# HELP hasura_subscription_db_execution_time_seconds Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"]
+
+messagesDroppedHelpSpec :: Spec
+messagesDroppedHelpSpec = describe "hasura_websocket_messages_dropped_total" $ do
+  it "says in its help that a full send queue cancels the operation" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    rendered <- renderSample metrics
+    filter ("# HELP hasura_websocket_messages_dropped_total " `T.isPrefixOf`) (T.lines rendered)
+      `shouldBe` ["# HELP hasura_websocket_messages_dropped_total Total number of messages rejected because the websocket send queue was full; each rejection cancels its operation"]
 
 -- | A subscription poll serving several operation names is observed once per
 -- name with granular metrics (each observation carries its name) and once

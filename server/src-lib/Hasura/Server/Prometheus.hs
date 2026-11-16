@@ -4,7 +4,8 @@
 -- adds a metric specification and a store-backed constructor for the Prometheus metrics,
 -- used by the GET /v1/metrics endpoint; observes a subscription poll once when granular
 -- metrics are off; says in the help of the subscription database time that the pool wait is
--- left out. See BBB-CHANGES.md.
+-- left out; describes what a full websocket send queue does in the help of its counter. See
+-- BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -762,7 +763,7 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
   WebsocketMessagesDroppedTotal ::
     PrometheusMetricsSpec
       "hasura_websocket_messages_dropped_total"
-      "Total number of messages dropped because the websocket send queue was full"
+      "Total number of messages rejected because the websocket send queue was full; each rejection cancels its operation"
       'CounterType
       ()
 
