@@ -24,7 +24,16 @@ The fork and every modification listed here are distributed under the same
 - `scripts/build-v2.sh`: builds the community edition `graphql-engine` executable from
   source with the toolchain the upstream tag declares (GHC 9.14.1, cabal-install 3.16.1.0)
   and the unmodified upstream `cabal.project` / `cabal.project.freeze`. The binary links
-  the system `libgmp`, `libpq`, `libkrb5` and `libodbc` dynamically.
+  the system `libgmp`, `libpq`, `libkrb5` and `libodbc` dynamically. With `--dev-version`
+  it stamps a test build: the version is `HASURA_VERSION` followed by `-dev.g` and the
+  first 8 hex digits of HEAD (for example `v2.50.7-bbb2-dev.g0123abcd`), so `/v1/version`
+  tells which commit a test binary was built from. The `g` keeps the hash an alphanumeric
+  semver identifier: `Hasura.Server.Version` parses the version as semver, which reads 8
+  decimal digits as a number and drops a leading zero. `.dirty` is appended when the tree
+  has uncommitted changes to tracked files. A later build without `--dev-version` and
+  without `HASURA_VERSION` refuses to reuse a `server/CURRENT_VERSION` that holds a test
+  build version, since it names another commit. The `version` mode only writes
+  `server/CURRENT_VERSION`.
 - `scripts/deploy-dev-host.sh`: development helper that deploys a locally built binary to a
   BigBlueButton development host over SSH.
 - `.github/workflows/build-v2.yml`: GitHub Actions workflow that builds the binary for
@@ -298,5 +307,7 @@ Every file below carries a modification notice at the top, as required by Apache
   `server/test-postgres/Main.hs`: test the pool observer against a real database; `Main`
   passes the metrics to the source resolver.
 - `server/graphql-engine.cabal`: also registers the new test module.
+- `server/src-test/Hasura/Server/VersionSpec.hs`: tests the version form of a test build
+  (see `scripts/build-v2.sh` above).
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

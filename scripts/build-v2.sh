@@ -19,12 +19,16 @@
 #   ./scripts/build-v2.sh build          # build only (assumes deps present)
 #   ./scripts/build-v2.sh all            # deps + build
 #   ./scripts/build-v2.sh clean          # clean dist-newstyle + CURRENT_VERSION
+#   ./scripts/build-v2.sh version        # only write server/CURRENT_VERSION
 #
 # Flags:
 #   --no-system-deps        # skip apt-get (toolchain assumed present)
 #   --no-cabal-update       # skip 'cabal update'
 #   --ghc VERSION           # override GHC version
 #   --jobs N                # override CABAL_JOBS (default: env or 2)
+#   --dev-version           # stamp a test build: HASURA_VERSION plus
+#                           # "-dev.g<first 8 hex digits of HEAD>", and ".dirty"
+#                           # when tracked files have uncommitted changes
 #
 # Environment:
 #   HASURA_VERSION          # version string written to server/CURRENT_VERSION
@@ -54,6 +58,7 @@ GHCUP_VERSION="0.1.50.2"
 GHCUP_SHA256="ff6288df9758211372d8242fe830d8e6be6a8365d9406f1c9bde144b7e744143"
 
 MODE="all"
+DEV_VERSION=0
 INSTALL_SYSTEM_DEPS=1
 RUN_CABAL_UPDATE=1
 
@@ -75,6 +80,7 @@ Modes (one of):
   build          Build graphql-engine (no deps)
   all            deps + build (default)
   clean          Remove dist-newstyle and server/CURRENT_VERSION
+  version        Only write server/CURRENT_VERSION
 
 Backwards-compatible aliases:
   --skip-deps    Same as "build"
@@ -84,17 +90,21 @@ Flags:
   --no-cabal-update      Do not run 'cabal update'
   --ghc VERSION          Use specific GHC version (default: ${GHC_VERSION_DEFAULT})
   --jobs N               Override CABAL_JOBS (default: ${CABAL_JOBS})
+  --dev-version          Stamp a test build: the version is HASURA_VERSION
+                         followed by "-dev.g" and the first 8 hex digits of HEAD,
+                         and ".dirty" when tracked files have uncommitted changes
 
 Examples:
   $0 deps --no-system-deps
   $0 build --jobs 4
   $0 all --ghc ${GHC_VERSION_DEFAULT}
+  HASURA_VERSION=v2.50.7-bbb2 $0 build --dev-version
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    deps|build|all|clean)
+    deps|build|all|clean|version)
       MODE="$1"
       shift
       ;;
@@ -104,6 +114,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-system-deps)
       INSTALL_SYSTEM_DEPS=0
+      shift
+      ;;
+    --dev-version)
+      DEV_VERSION=1
       shift
       ;;
     --no-cabal-update)
@@ -189,12 +203,37 @@ install_deps() {
 ensure_version_file() {
   log "Ensuring server/CURRENT_VERSION"
   local version_file="$ROOT_DIR/server/CURRENT_VERSION"
-  if [[ -n "${HASURA_VERSION:-}" ]]; then
+  if [[ $DEV_VERSION -eq 1 ]]; then
+    if [[ -z "${HASURA_VERSION:-}" ]]; then
+      echo "--dev-version needs HASURA_VERSION, the version the test build is based on" >&2
+      exit 1
+    fi
+    local commit
+    commit=$(git -C "$ROOT_DIR" rev-parse HEAD) || {
+      echo "--dev-version needs a git checkout to read the commit from" >&2
+      exit 1
+    }
+    # A test build reports the commit it was built from, so every collected metric
+    # can be traced to its binary. The "g" keeps the identifier valid semver when the
+    # 8 digits are all decimal with a leading zero, and ".dirty" marks a build from a
+    # tree with uncommitted changes, which no commit describes.
+    local stamp="g${commit:0:8}"
+    if ! git -C "$ROOT_DIR" diff --quiet HEAD --; then
+      stamp="${stamp}.dirty"
+    fi
+    echo "${HASURA_VERSION}-dev.${stamp}" > "$version_file"
+  elif [[ -n "${HASURA_VERSION:-}" ]]; then
     echo "$HASURA_VERSION" > "$version_file"
   elif [[ ! -f "$version_file" ]]; then
     echo "HASURA_VERSION is not set. Set it (e.g. HASURA_VERSION=v2.50.7-bbb1)" >&2
     echo "so server/CURRENT_VERSION can be written; there is no fallback, so a" >&2
     echo "fork build never presents itself with an upstream version string." >&2
+    exit 1
+  elif grep -q -- '-dev\.' "$version_file"; then
+    # The file names the commit of an earlier test build, not necessarily this one.
+    echo "server/CURRENT_VERSION holds a test build version ($(cat "$version_file"))," >&2
+    echo "which names the commit it was built from. Rebuild with --dev-version to stamp" >&2
+    echo "the current commit, or set HASURA_VERSION for a release build." >&2
     exit 1
   fi
   log "server/CURRENT_VERSION = $(cat "$version_file")"
@@ -243,6 +282,9 @@ case "$MODE" in
     ;;
   clean)
     do_clean
+    ;;
+  version)
+    ensure_version_file
     ;;
   *)
     echo "Unknown mode: $MODE" >&2
