@@ -19,6 +19,7 @@ import Control.Exception qualified as Exception
 import Control.Immortal qualified as Immortal
 import Control.Lens ((.~))
 import Data.Aeson qualified as J
+import Data.ByteString qualified as B
 import Data.ByteString.Lazy.UTF8 qualified as LBS
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -58,6 +59,7 @@ import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
 import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
+import Language.GraphQL.Draft.Syntax (unsafeMkName)
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
 import StmContainers.Map qualified as STMMap
@@ -65,6 +67,7 @@ import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
 import System.Metrics
 import System.Metrics.Prometheus qualified as Prometheus
+import System.Metrics.Prometheus.CounterVector qualified as CounterVector
 import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
 import System.Metrics.Prometheus.Histogram (HistogramSample (..))
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
@@ -749,6 +752,108 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
       it "counts the active subscriptions down" $ do
         activeBeforeAndAfter `shouldBe` (1, 0)
 
+    describe "Per-operation subscription metrics" $ do
+      let -- A poller whose only polls are the ones a test runs: a sentinel subscriber, on a
+          -- cursor past every row, creates it, and its thread is stopped at once.
+          newOpScenario :: IO OpScenario
+          newOpScenario = do
+            subscriptionState <- initSubscriptionsState (const (pure ()))
+            promMetrics <- makeDummyPrometheusMetrics
+            wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
+            received <- newIORef ([] :: [(Text, Int)])
+            let subOptions = mkSubscriptionsOptions Nothing Nothing
+                quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+                plan cohortId cursor =
+                  SubscriptionQueryPlan
+                    (ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery multiplexedQuery)
+                    srcConfig
+                    cohortId
+                    Nothing
+                    (mkCohortKey (tshow cursor))
+                    Nothing
+                record name response =
+                  atomicModifyIORef' received (\rs -> (rs <> [(name, either (const 0) (B.length . _lqrPayload) response)], ()))
+                joinNamed opName name cursor = do
+                  cohortId <- newCohortId
+                  addStreamSubscriptionQuery
+                    @('Postgres 'Vanilla)
+                    quietLogger
+                    dummyServerMetrics
+                    promMetrics
+                    (mkSubscriberMetadata wsId (unsafeMkOperationId name) Nothing (RequestId name))
+                    subscriptionState
+                    (pure (subOptions, subOptions))
+                    SNDefault
+                    paramQueryHash
+                    opName
+                    (RequestId name)
+                    [G.name|numbers_stream|]
+                    (plan cohortId (cursor :: Int))
+                    (pure GranularMetricsOff)
+                    (record name)
+                    Nothing
+                    []
+                    (pure ModelInfoLogOff)
+                leaveNamed opName details =
+                  removeStreamingQuery quietLogger dummyServerMetrics promMetrics subscriptionState details (pure GranularMetricsOff) opName
+                pollers = STM.atomically $ fmap snd <$> ListT.toList (STMMap.listT (_ssStreamQueryMap subscriptionState))
+            _ <- joinNamed (Just (OperationName [G.name|Sentinel|])) "sentinel" 1000
+            poller <- maybe (error "no poller") pure . listToMaybe =<< pollers
+            STM.atomically (STM.readTMVar (_pIOState poller)) >>= Immortal.stop . _pThread
+            let poll duringPoll =
+                  pollStreamingQuery
+                    @('Postgres 'Vanilla)
+                    pollerId
+                    pollerResponseState
+                    defaultSubscriptionOptions
+                    (SNDefault, srcConfig)
+                    (mkRoleNameE "user")
+                    paramQueryHash
+                    (MultiplexedQuery multiplexedQuery)
+                    (_pCohorts poller)
+                    [G.name|numbers_stream|]
+                    (const $ pure ())
+                    duringPoll
+                    promMetrics
+                    (pure GranularMetricsOff)
+                    (_pOperationNamesMap poller)
+                    Nothing
+                    Nothing
+                    quietLogger
+                    []
+                    (pure ModelInfoLogOff)
+                stopAll = pollers >>= traverse_ \p -> STM.atomically (STM.tryReadTMVar (_pIOState p)) >>= traverse_ (Immortal.stop . _pThread)
+            atomicModifyIORef' received (\_ -> ([], ()))
+            pure OpScenario {osJoin = joinNamed, osLeave = leaveNamed, osPoll = poll, osMetrics = promMetrics, osReceived = readIORef received, osStop = stopAll}
+          op = Just . OperationName . unsafeMkName
+          -- The value of a per-operation series of the streaming kind.
+          byOperation :: CounterVector.CounterVector SubscriptionLabel -> Text -> IO Double
+          byOperation vector name = Map.findWithDefault 0 (SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) <$> CounterVector.read vector
+          renameNumbers from to = runPgSourceWriteTx srcConfig InternalRawQuery (PG.unitQE defaultTxErrorHandler (PG.fromText ("ALTER TABLE \"public\".\"" <> from <> "\" RENAME TO \"" <> to <> "\"")) () False) >>= (`onLeft` (printErrExit . showQErr))
+
+      describe "polls and failed poll batches" $ do
+        -- Two operations in one poller; a poll, then a poll whose query fails.
+        (pollsAfterPoll, errorsAfterPoll, pollsAfterError, errorsAfterError) <- runIO do
+          OpScenario {..} <- newOpScenario
+          _ <- osJoin (op "First") "a" 1
+          _ <- osJoin (op "Second") "b" 1
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              read3 vector = traverse (byOperation vector) ["First", "Second", "Sentinel"]
+          osPoll Nothing
+          polls <- read3 submPollsByOperation
+          errors <- read3 submPollErrorsByOperation
+          osPoll (Just $ renameNumbers "numbers" "numbers_renamed")
+          renameNumbers "numbers_renamed" "numbers"
+          result <- (polls,errors,,) <$> read3 submPollsByOperation <*> read3 submPollErrorsByOperation
+          osStop
+          pure result
+        it "a poll counts once for each operation the poller serves" $ do
+          pollsAfterPoll `shouldBe` [1, 1, 1]
+          errorsAfterPoll `shouldBe` [0, 0, 0]
+        it "a failed batch counts once for each operation, and the failed poll is still a poll" $ do
+          pollsAfterError `shouldBe` [2, 2, 2]
+          errorsAfterError `shouldBe` [1, 1, 1]
+
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId
       let -- Holds one of the pool's connections for 1.5 s.
@@ -849,6 +954,18 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         timeOfException `shouldSatisfy` maybe False (>= 0.2)
 
   runIO teardown
+
+-- | What a test of the per-operation metrics drives: subscribers joining and leaving under an
+-- operation name, polls run by the test (with an action to run while the poll is under way), the
+-- poller's metrics, and the results each subscriber received (name and payload bytes).
+data OpScenario = OpScenario
+  { osJoin :: Maybe OperationName -> Text -> Int -> IO SubscriberDetails,
+    osLeave :: Maybe OperationName -> SubscriberDetails -> IO (),
+    osPoll :: Maybe (IO ()) -> IO (),
+    osMetrics :: PrometheusMetrics,
+    osReceived :: IO [(Text, Int)],
+    osStop :: IO ()
+  }
 
 -- | Stands for the exception a query throws when its connection is lost.
 data ConnectionLost = ConnectionLost

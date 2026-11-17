@@ -42,7 +42,7 @@ import Hasura.RQL.Types.BackendType (BackendType (..), PostgresKind (Vanilla))
 import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Refined (unrefine)
 import System.Metrics.Prometheus.Gauge qualified as Prometheus.Gauge
@@ -210,6 +210,9 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
               _pdErrors = Just pollDetailsErrors
             }
   postPollHook pollDetails
+  operationLabels <- pollOperationLabels prometheusMetrics operationNamesMap
+  recordPollByOperation prometheusMetrics liveQuerySubscriptionLabel operationLabels
+    $ PollByOperation {pboFailedBatches = length (catMaybes maybeErrors)}
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   modelInfoLogStatus' <- modelInfoLogStatus
   when (modelInfoLogStatus' == ModelInfoLogOn) $ do

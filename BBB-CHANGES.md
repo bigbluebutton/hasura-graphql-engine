@@ -271,6 +271,16 @@ always on.
   observed each once
   for every operation name the poller served, so their counts overstated polls and batches
   (see "One observation per subscription poll" above).
+- **Per-operation series.** They are counters and gauges, never histograms, labeled by
+  `subscription_kind` and `operation_name` (plus `changed` where stated). A poller can serve
+  several operation names (same query, different names); each series attributes the poll as
+  follows:
+  - `hasura_subscription_polls_total` and `hasura_subscription_poll_errors_total` are events:
+    each operation the poller serves counts the poll, and each failed batch, once.
+    Compared with the database (`pg_stat_statements`), the calls of a subscription's multiplexed
+    query are its poll batches (one per poll while the poller's cohorts fit in one batch) plus
+    one validation run per subscription start (`testMultiplexedQueryTx`,
+    `Hasura.Backends.Postgres.Instances.Execute`), which no metric counts as a poll.
 
 ## Formatting
 

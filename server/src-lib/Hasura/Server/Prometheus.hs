@@ -1,13 +1,14 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds a metric specification and a store-backed constructor for the Prometheus metrics, used
--- by the GET /v1/metrics endpoint; observes a subscription poll once, by subscription kind;
--- labels operations by their capped name, always, without the query hash, up to a configurable
--- number of names; sets the buckets of the subscription poll times; says in the help of the
--- subscription database time that the pool wait is left out; describes what a full websocket
--- send queue does in the help of its counter; adds the Postgres pool metrics and the pool
--- observer that records them. See BBB-CHANGES.md.
+-- adds a metric specification and a store-backed constructor for the Prometheus
+-- metrics, used by the GET /v1/metrics endpoint; observes a subscription poll once, by
+-- subscription kind; labels operations by their capped name, always, without the query
+-- hash, up to a configurable number of names; adds the per-operation subscription metrics;
+-- sets the buckets of the subscription poll times; says in the help of the subscription
+-- database time that the pool wait is left out; describes what a full websocket send queue
+-- does in the help of its counter; adds the Postgres pool metrics and the pool observer that
+-- records them. See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -49,6 +50,9 @@ module Hasura.Server.Prometheus
     OperationNameLabel (..),
     operationNameLabel,
     subscriptionLabel,
+    pollOperationLabels,
+    PollByOperation (..),
+    recordPollByOperation,
     unnamedOperationLabel,
     otherOperationLabel,
     defaultOperationNameLimit,
@@ -271,7 +275,11 @@ data SubscriptionMetrics = SubscriptionMetrics
     submActiveStreamingPollersInError :: Gauge,
     submTotalTime :: HistogramVector.HistogramVector SubscriptionKindLabel,
     submDBExecTotalTime :: HistogramVector.HistogramVector SubscriptionKindLabel,
-    submActiveSubscriptions :: GaugeVector.GaugeVector SubscriptionLabel
+    submActiveSubscriptions :: GaugeVector.GaugeVector SubscriptionLabel,
+    -- | Polls, by the operations the poller serves (+1 for each operation present).
+    submPollsByOperation :: CounterVector SubscriptionLabel,
+    -- | Failed poll batches, by the operations the poller serves (+1 for each operation present).
+    submPollErrorsByOperation :: CounterVector SubscriptionLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -377,6 +385,8 @@ makeDummySubscriptionMetrics = do
   submTotalTime <- HistogramVector.new []
   submDBExecTotalTime <- HistogramVector.new []
   submActiveSubscriptions <- GaugeVector.new
+  submPollsByOperation <- CounterVector.new
+  submPollErrorsByOperation <- CounterVector.new
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -541,6 +551,27 @@ newtype OperationNameLabel = OperationNameLabel {unOperationNameLabel :: Text}
 subscriptionLabel :: PrometheusMetrics -> SubscriptionKindLabel -> Maybe OperationName -> IO SubscriptionLabel
 subscriptionLabel prometheusMetrics kind operationName =
   SubscriptionLabel kind . Just . DynamicGraphqlOperationLabel <$> operationNameLabel prometheusMetrics operationName
+
+-- | The operations a poller serves, by label, with their numbers of subscribers. Names that get
+-- the same label ("(other)") are counted together.
+pollOperationLabels :: PrometheusMetrics -> HashMap (Maybe OperationName) Int -> IO (HashMap OperationNameLabel Int)
+pollOperationLabels prometheusMetrics names =
+  HashMap.fromListWith (+) <$> for (HashMap.toList names) \(name, subscribers) -> (,subscribers) <$> operationNameLabel prometheusMetrics name
+
+-- | What a poll did, for the per-operation metrics.
+data PollByOperation = PollByOperation
+  { -- | the poll's batches that failed
+    pboFailedBatches :: Int
+  }
+
+-- | Record a poll in the per-operation metrics of the operations the poller serves. These are
+-- events, so each operation present counts the poll once.
+recordPollByOperation :: PrometheusMetrics -> SubscriptionKindLabel -> HashMap OperationNameLabel Int -> PollByOperation -> IO ()
+recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind operations PollByOperation {..} =
+  for_ (HashMap.keys operations) \operation -> do
+    let label = SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation))
+    CounterVector.inc submPollsByOperation label
+    when (pboFailedBatches > 0) $ CounterVector.add submPollErrorsByOperation label (fromIntegral pboFailedBatches)
 
 -- | The label value of an operation without a name.
 unnamedOperationLabel :: OperationNameLabel
@@ -855,6 +886,18 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"
       'HistogramType
       SubscriptionKindLabel
+  SubscriptionPollsTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_polls_total"
+      "Total number of subscription polls, by the operations the poller serves"
+      'CounterType
+      SubscriptionLabel
+  SubscriptionPollErrorsTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_poll_errors_total"
+      "Total number of subscription poll batches that failed"
+      'CounterType
+      SubscriptionLabel
   ActiveSubscriptions ::
     PrometheusMetricsSpec
       "hasura_active_subscriptions"
@@ -1087,6 +1130,8 @@ makeSubscriptionMetrics store = do
   submDBExecTotalTime <-
     createHistogramVector pollAndPoolTimeBuckets SubscriptionDbExecutionTimeSeconds store OrdMap.toList
   submActiveSubscriptions <- createGaugeVector ActiveSubscriptions store OrdMap.toList
+  submPollsByOperation <- createCounterVector SubscriptionPollsTotal store OrdMap.toList
+  submPollErrorsByOperation <- createCounterVector SubscriptionPollErrorsTotal store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

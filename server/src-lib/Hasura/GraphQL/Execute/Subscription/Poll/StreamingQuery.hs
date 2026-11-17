@@ -44,7 +44,7 @@ import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.SQL.Value (TxtEncodedVal (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionMetrics (..), streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), pollOperationLabels, recordPollByOperation, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Refined (unrefine)
@@ -474,6 +474,9 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
     for_ (modelInfoList) $ \(ModelInfoPart modelName modelType modelSourceName modelSourceType modelQueryType) -> do
       unLogger logger $ ModelInfoLog LevelInfo $ ModelInfo modelName (toTxt modelType) (toTxt <$> modelSourceName) (toTxt <$> modelSourceType) (toTxt modelQueryType) False
   postPollHook pollDetails
+  operationLabels <- pollOperationLabels prometheusMetrics operationNames
+  recordPollByOperation prometheusMetrics streamingSubscriptionLabel operationLabels
+    $ PollByOperation {pboFailedBatches = length (catMaybes maybeErrors)}
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   liftIO $ HistogramVector.observe totalTimeMetric streamingSubscriptionLabel (realToFrac totalTime)
   where

@@ -15,6 +15,7 @@ module Hasura.Server.PrometheusSpec (spec) where
 
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
+import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -200,6 +201,11 @@ operationNameLabelSpec = describe "operationNameLabel" $ do
     admitted 5 10 `shouldReturn` 5
     admitted 10000 10001 `shouldReturn` 10000
 
+  it "counts two names past the cap in one poller as one (other), with their subscribers added" $ do
+    metrics <- makeDummyPrometheusMetrics
+    for_ [1 .. defaultOperationNameLimit] \i -> operationNameLabel metrics (opName ("op" <> tshow i))
+    labels <- pollOperationLabels metrics (HashMap.fromList [(opName "lateA", 2), (opName "lateB", 3), (opName "op1", 1)])
+    labels `shouldBe` HashMap.fromList [(otherOperationLabel, 5), (OperationNameLabel "op1", 1)]
   it "admits no name for a request that failed, and labels it by name only if already admitted" $ do
     metrics <- makeDummyPrometheusMetrics
     let request status name = do
@@ -285,6 +291,8 @@ observeEveryVectorOnce metrics = do
   HistogramVector.observe (submTotalTime subm) streamingSubscriptionLabel 0.1
   HistogramVector.observe (submDBExecTotalTime subm) streamingSubscriptionLabel 0.1
   GaugeVector.inc (submActiveSubscriptions subm) subLabel
+  CounterVector.inc (submPollsByOperation subm) subLabel
+  CounterVector.inc (submPollErrorsByOperation subm) subLabel
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -340,6 +348,8 @@ expectedTypeLines =
       "# TYPE hasura_scheduled_trigger_bytes_sent_total counter",
       "# TYPE hasura_subscription_db_execution_time_seconds histogram",
       "# TYPE hasura_subscription_total_time_seconds histogram",
+      "# TYPE hasura_subscription_polls_total counter",
+      "# TYPE hasura_subscription_poll_errors_total counter",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",
