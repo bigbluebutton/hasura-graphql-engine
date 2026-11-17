@@ -53,6 +53,8 @@ module Hasura.Server.Prometheus
     pollOperationLabels,
     PollByOperation (..),
     recordPollByOperation,
+    forgetPollerByOperation,
+    registerPollerByOperation,
     unnamedOperationLabel,
     otherOperationLabel,
     defaultOperationNameLimit,
@@ -71,6 +73,7 @@ module Hasura.Server.Prometheus
   )
 where
 
+import Control.Exception (mask_)
 import Data.HashMap.Internal.Strict qualified as Map
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
@@ -79,6 +82,7 @@ import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
+import Data.UUID (UUID)
 import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
 import GHC.TypeLits (Symbol)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
@@ -279,7 +283,15 @@ data SubscriptionMetrics = SubscriptionMetrics
     -- | Polls, by the operations the poller serves (+1 for each operation present).
     submPollsByOperation :: CounterVector SubscriptionLabel,
     -- | Failed poll batches, by the operations the poller serves (+1 for each operation present).
-    submPollErrorsByOperation :: CounterVector SubscriptionLabel
+    submPollErrorsByOperation :: CounterVector SubscriptionLabel,
+    -- | Cohorts processed by the polls of the pollers serving an operation.
+    submCohortsProcessedByOperation :: CounterVector SubscriptionLabel,
+    -- | Cohorts of the pollers serving an operation, at their last poll.
+    submActiveCohortsByOperation :: GaugeVector.GaugeVector SubscriptionLabel,
+    -- | What each poller last added to 'submActiveCohortsByOperation', by poller id, so that a
+    -- poll applies only the difference and a removed poller takes its share out. A poller is in
+    -- it from its creation to its removal.
+    submReportedCohorts :: IORef (HashMap UUID (OrdMap.Map SubscriptionLabel Int))
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -387,6 +399,9 @@ makeDummySubscriptionMetrics = do
   submActiveSubscriptions <- GaugeVector.new
   submPollsByOperation <- CounterVector.new
   submPollErrorsByOperation <- CounterVector.new
+  submCohortsProcessedByOperation <- CounterVector.new
+  submActiveCohortsByOperation <- GaugeVector.new
+  submReportedCohorts <- newIORef mempty
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -560,18 +575,59 @@ pollOperationLabels prometheusMetrics names =
 
 -- | What a poll did, for the per-operation metrics.
 data PollByOperation = PollByOperation
-  { -- | the poll's batches that failed
-    pboFailedBatches :: Int
+  { -- | the poller's id
+    pboPollerId :: UUID,
+    -- | the poll's batches that failed
+    pboFailedBatches :: Int,
+    -- | the cohorts the poll processed
+    pboCohorts :: Int
   }
 
 -- | Record a poll in the per-operation metrics of the operations the poller serves. These are
 -- events, so each operation present counts the poll once.
 recordPollByOperation :: PrometheusMetrics -> SubscriptionKindLabel -> HashMap OperationNameLabel Int -> PollByOperation -> IO ()
-recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind operations PollByOperation {..} =
-  for_ (HashMap.keys operations) \operation -> do
-    let label = SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation))
+recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind operations PollByOperation {..} = do
+  let labels = [SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation)) | operation <- HashMap.keys operations]
+  for_ labels \label -> do
     CounterVector.inc submPollsByOperation label
     when (pboFailedBatches > 0) $ CounterVector.add submPollErrorsByOperation label (fromIntegral pboFailedBatches)
+    CounterVector.add submCohortsProcessedByOperation label (fromIntegral pboCohorts)
+  -- The gauge gets only the difference from what this poller added at its last poll: an
+  -- operation the poller no longer serves drops its share. A poll that ends after its poller was
+  -- removed (and so forgotten) changes nothing.
+  -- The record and the gauge change together: an exception between the two (the poller stopped)
+  -- would leave the record ahead of the gauge, and the removal would take out what the gauge
+  -- never got. Neither step blocks.
+  let reported = OrdMap.fromList [(label, pboCohorts) | label <- labels]
+  -- A poll that reports what the poller's last poll reported (the usual case) writes nothing. Only
+  -- the poller writes its own record, so the record cannot change between the read and the write
+  -- but by the poller's removal, which the write sees.
+  mask_ do
+    current <- HashMap.lookup pboPollerId <$> readIORef submReportedCohorts
+    when (current /= Just reported) do
+      previous <- atomicModifyIORef' submReportedCohorts \byPoller ->
+        case HashMap.lookup pboPollerId byPoller of
+          Nothing -> (byPoller, Nothing)
+          Just previous -> (HashMap.insert pboPollerId reported byPoller, Just previous)
+      for_ previous \previousCohorts -> applyCohortsDifference submActiveCohortsByOperation previousCohorts reported
+
+-- | Registers a new poller for the per-operation gauges, before its first poll.
+registerPollerByOperation :: PrometheusMetrics -> UUID -> IO ()
+registerPollerByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} pollerId =
+  atomicModifyIORef' submReportedCohorts \byPoller -> (HashMap.insert pollerId mempty byPoller, ())
+
+-- | Take out of the per-operation gauges what a removed poller added to them, and forget the
+-- poller, so that a poll of it still running cannot add to them again.
+forgetPollerByOperation :: PrometheusMetrics -> UUID -> IO ()
+forgetPollerByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} pollerId = mask_ do
+  previous <- atomicModifyIORef' submReportedCohorts \byPoller ->
+    (HashMap.delete pollerId byPoller, HashMap.lookupDefault mempty pollerId byPoller)
+  applyCohortsDifference submActiveCohortsByOperation previous mempty
+
+applyCohortsDifference :: GaugeVector.GaugeVector SubscriptionLabel -> OrdMap.Map SubscriptionLabel Int -> OrdMap.Map SubscriptionLabel Int -> IO ()
+applyCohortsDifference gauge previous current =
+  for_ (OrdMap.toList (OrdMap.unionWith (+) current (negate <$> previous))) \(label, difference) ->
+    when (difference /= 0) $ GaugeVector.add gauge label (fromIntegral difference)
 
 -- | The label value of an operation without a name.
 unnamedOperationLabel :: OperationNameLabel
@@ -898,6 +954,18 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Total number of subscription poll batches that failed"
       'CounterType
       SubscriptionLabel
+  SubscriptionCohortsProcessedTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_cohorts_processed_total"
+      "Total number of cohorts processed by the polls of the pollers serving an operation"
+      'CounterType
+      SubscriptionLabel
+  ActiveSubscriptionCohortsByOperation ::
+    PrometheusMetricsSpec
+      "hasura_active_subscription_cohorts_by_operation"
+      "Current number of active cohorts of the pollers serving an operation"
+      'GaugeType
+      SubscriptionLabel
   ActiveSubscriptions ::
     PrometheusMetricsSpec
       "hasura_active_subscriptions"
@@ -1132,6 +1200,9 @@ makeSubscriptionMetrics store = do
   submActiveSubscriptions <- createGaugeVector ActiveSubscriptions store OrdMap.toList
   submPollsByOperation <- createCounterVector SubscriptionPollsTotal store OrdMap.toList
   submPollErrorsByOperation <- createCounterVector SubscriptionPollErrorsTotal store OrdMap.toList
+  submCohortsProcessedByOperation <- createCounterVector SubscriptionCohortsProcessedTotal store OrdMap.toList
+  submActiveCohortsByOperation <- createGaugeVector ActiveSubscriptionCohortsByOperation store OrdMap.toList
+  submReportedCohorts <- newIORef mempty
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

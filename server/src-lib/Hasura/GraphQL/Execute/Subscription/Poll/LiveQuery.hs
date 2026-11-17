@@ -212,7 +212,11 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
   postPollHook pollDetails
   operationLabels <- pollOperationLabels prometheusMetrics operationNamesMap
   recordPollByOperation prometheusMetrics liveQuerySubscriptionLabel operationLabels
-    $ PollByOperation {pboFailedBatches = length (catMaybes maybeErrors)}
+    $ PollByOperation
+      { pboPollerId = unPollerId pollerId,
+        pboFailedBatches = length (catMaybes maybeErrors),
+        pboCohorts = sum (map (length . _bedCohorts) batchesDetails)
+      }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   modelInfoLogStatus' <- modelInfoLogStatus
   when (modelInfoLogStatus' == ModelInfoLogOn) $ do

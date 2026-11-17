@@ -17,8 +17,10 @@ import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
 import Data.HashMap.Strict qualified as HashMap
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
+import Data.UUID qualified as UUID
 import Database.PG.Query qualified as PG
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
@@ -42,6 +44,39 @@ spec = do
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
   postgresPoolObserverSpec
+  cohortsGaugeSpec
+
+-- | The per-operation cohorts gauge follows the pollers from their registration to their removal.
+cohortsGaugeSpec :: Spec
+cohortsGaugeSpec = describe "the active cohorts by operation" $ do
+  it "counts a registered poller's cohorts, takes them out on removal and ignores a later poll" $ do
+    metrics <- makeDummyPrometheusMetrics
+    let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f01")
+        report = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 3)
+        gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
+    report
+    unregistered <- gauge
+    registerPollerByOperation metrics pollerId
+    report
+    registered <- gauge
+    forgetPollerByOperation metrics pollerId
+    removed <- gauge
+    report
+    late <- gauge
+    (unregistered, registered, removed, late) `shouldBe` ([], [3], [0], [0])
+
+  it "leaves the gauge as it is on a repeated report, and moves it on a changed one" $ do
+    metrics <- makeDummyPrometheusMetrics
+    let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f02")
+        report cohorts = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 cohorts)
+        gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
+    registerPollerByOperation metrics pollerId
+    report 3
+    report 3
+    repeated <- gauge
+    report 5
+    changed <- gauge
+    (repeated, changed) `shouldBe` ([3], [5])
 
 -- | The observer of a pool records under the pool's label: "(metadata)" or the source name.
 postgresPoolObserverSpec :: Spec
@@ -293,6 +328,8 @@ observeEveryVectorOnce metrics = do
   GaugeVector.inc (submActiveSubscriptions subm) subLabel
   CounterVector.inc (submPollsByOperation subm) subLabel
   CounterVector.inc (submPollErrorsByOperation subm) subLabel
+  CounterVector.inc (submCohortsProcessedByOperation subm) subLabel
+  GaugeVector.inc (submActiveCohortsByOperation subm) subLabel
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -350,6 +387,8 @@ expectedTypeLines =
       "# TYPE hasura_subscription_total_time_seconds histogram",
       "# TYPE hasura_subscription_polls_total counter",
       "# TYPE hasura_subscription_poll_errors_total counter",
+      "# TYPE hasura_subscription_cohorts_processed_total counter",
+      "# TYPE hasura_active_subscription_cohorts_by_operation gauge",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

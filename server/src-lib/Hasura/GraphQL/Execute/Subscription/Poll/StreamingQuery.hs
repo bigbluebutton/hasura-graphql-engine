@@ -476,7 +476,11 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
   postPollHook pollDetails
   operationLabels <- pollOperationLabels prometheusMetrics operationNames
   recordPollByOperation prometheusMetrics streamingSubscriptionLabel operationLabels
-    $ PollByOperation {pboFailedBatches = length (catMaybes maybeErrors)}
+    $ PollByOperation
+      { pboPollerId = unPollerId pollerId,
+        pboFailedBatches = length (catMaybes maybeErrors),
+        pboCohorts = sum (map (length . _bedCohorts) batchesDetails)
+      }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   liftIO $ HistogramVector.observe totalTimeMetric streamingSubscriptionLabel (realToFrac totalTime)
   where

@@ -281,6 +281,15 @@ always on.
     query are its poll batches (one per poll while the poller's cohorts fit in one batch) plus
     one validation run per subscription start (`testMultiplexedQueryTx`,
     `Hasura.Backends.Postgres.Instances.Execute`), which no metric counts as a poll.
+  - `hasura_subscription_cohorts_processed_total` counts, for each operation the poller serves,
+    the cohorts the poll processed; `hasura_active_subscription_cohorts_by_operation` holds,
+    for each operation, the cohorts of the pollers serving it, as of each poller's last poll.
+    Both count the cohorts of the pollers, not the operation's subscribers, so the series of
+    two operations sharing a poller count the same cohorts, and the poll does no work per
+    subscriber for them. The gauge changes when a poller polls (an operation that left the
+    poller drops out at the next poll) and when a poller is removed. A poller is registered
+    when it is created and forgotten when it is removed, and a poll that ends after the removal
+    (its thread is stopped, not awaited) changes nothing.
 
 ## Formatting
 

@@ -1,8 +1,9 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- removeStreamingQuery decrements the poller's operation name count and the active
 -- subscriptions gauge once per removed subscriber instead of once per cohort; the active
--- subscriptions gauge is labeled by operation name, always, without the query hash. See
--- BBB-CHANGES.md.
+-- subscriptions gauge is labeled by operation name, always, without the query hash; a
+-- removed poller takes its share of the per-operation cohorts gauge out. See BBB-
+-- CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | Top-level management of subscription poller threads.
@@ -62,7 +63,9 @@ import Hasura.Server.Metrics (ServerMetrics (..))
 import Hasura.Server.Prometheus
   ( PrometheusMetrics (..),
     SubscriptionMetrics (..),
+    forgetPollerByOperation,
     liveQuerySubscriptionLabel,
+    registerPollerByOperation,
     streamingSubscriptionLabel,
     subscriptionLabel,
   )
@@ -221,6 +224,7 @@ addLiveQuery
     -- cancelled after putTMVar
     for_ pollerMaybe $ \poller -> do
       pollerId <- PollerId <$> UUID.nextRandom
+      registerPollerByOperation prometheusMetrics (unPollerId pollerId)
       threadRef <- forkImmortal ("pollLiveQuery." <> show pollerId) logger
         $ forever
         $ do
@@ -342,6 +346,7 @@ addStreamSubscriptionQuery
     -- cancelled after putTMVar
     for_ handlerM $ \handler -> do
       pollerId <- PollerId <$> UUID.nextRandom
+      registerPollerByOperation prometheusMetrics (unPollerId pollerId)
       threadRef <- forkImmortal ("pollStreamingQuery." <> show (unPollerId pollerId)) logger
         $ forever
         $ do
@@ -463,13 +468,16 @@ removeLiveQuery logger serverMetrics prometheusMetrics lqState lqId@(SubscriberD
       if handlerIsEmpty
         then do
           STMMap.delete handlerId lqMap
-          threadRefM <- fmap _pThread <$> STM.tryReadTMVar ioState
+          ioStateM <- STM.tryReadTMVar ioState
           return
             $
             -- deferred IO:
-            case threadRefM of
-              Just threadRef -> do
+            case ioStateM of
+              Just (PollerIOState threadRef pollerId) -> do
                 Immortal.stop threadRef
+                -- A poll of it that is still ending reports nothing to the per-operation gauges
+                -- once the poller is forgotten.
+                forgetPollerByOperation prometheusMetrics (unPollerId pollerId)
                 liftIO $ do
                   pollerLastState <- STM.readTVarIO pollerState
                   when (pollerLastState == PRSError)
@@ -590,13 +598,16 @@ removeStreamingQuery logger serverMetrics prometheusMetrics subscriptionState (S
       if handlerIsEmpty
         then do
           STMMap.delete handlerId streamQMap
-          threadRefM <- fmap _pThread <$> STM.tryReadTMVar ioState
+          ioStateM <- STM.tryReadTMVar ioState
           return
             $
             -- deferred IO:
-            case threadRefM of
-              Just threadRef -> do
+            case ioStateM of
+              Just (PollerIOState threadRef pollerId) -> do
                 Immortal.stop threadRef
+                -- A poll of it that is still ending reports nothing to the per-operation gauges
+                -- once the poller is forgotten.
+                forgetPollerByOperation prometheusMetrics (unPollerId pollerId)
                 liftIO $ do
                   pollerLastState <- STM.readTVarIO pollerState
                   when (pollerLastState == PRSError)
