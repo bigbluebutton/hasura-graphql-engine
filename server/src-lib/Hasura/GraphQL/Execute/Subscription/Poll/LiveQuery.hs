@@ -18,6 +18,7 @@ import Control.Lens
 import Data.Aeson.Ordered qualified as JO
 import Data.ByteString qualified as BS
 import Data.HashMap.Strict qualified as HashMap
+import Data.IORef (newIORef, readIORef)
 import Data.List.Split (chunksOf)
 import Data.Monoid (Endo (..), Sum (..))
 import Data.Text.Extended
@@ -44,7 +45,7 @@ import Hasura.RQL.Types.BackendType (BackendType (..), PostgresKind (Vanilla))
 import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation, recordPushByOperation)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation, recordPushByOperation)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Refined (unrefine)
 import System.Metrics.Prometheus.Gauge qualified as Prometheus.Gauge
@@ -56,9 +57,10 @@ pushResultToCohort ::
   Maybe ResponseHash ->
   SubscriptionMetadata ->
   CohortSnapshot 'LiveQuery ->
-  -- | subscribers to which data has been pushed, subscribers which already
-  -- have this data (this information is exposed by metrics reporting)
-  IO ([SubscriberExecutionDetails], [SubscriberExecutionDetails])
+  -- | whether the result changed since the previous poll; subscribers to which data has been
+  -- pushed, subscribers which already have this data (this information is exposed by metrics
+  -- reporting)
+  IO (Bool, ([SubscriberExecutionDetails], [SubscriberExecutionDetails]))
 pushResultToCohort prometheusMetrics result !respHashM (SubscriptionMetadata dTime) cohortSnapshot = do
   prevRespHashM <- STM.readTVarIO respRef
   let changed = isExecError result || respHashM /= prevRespHashM
@@ -74,6 +76,7 @@ pushResultToCohort prometheusMetrics result !respHashM (SubscriptionMetadata dTi
   pushResultToSubscribers subscribersToPush
   recordPushByOperation prometheusMetrics liveQuerySubscriptionLabel changed (either (const 0) BS.length result) (map _sOperationName subscribersToPush)
   pure
+    $ (changed,)
     $ over
       (each . each)
       ( \Subscriber {..} ->
@@ -112,6 +115,7 @@ pollLiveQuery ::
   IO ()
 pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) roleName parameterizedQueryHash query cohortMap postPollHook prometheusMetrics _granularPrometheusMetricsState operationNamesMap' resolvedConnectionTemplate modifier logger modelInfoList modelInfoLogStatus = do
   operationNamesMap <- STM.atomically $ TMap.getMap operationNamesMap'
+  resultBytes <- newIORef (0, 0)
   (totalTime, (snapshotTime, (batchesDetails, maybeErrors))) <- withElapsedTime $ do
     -- snapshot the current cohorts and split them into batches
     (snapshotTime, cohortBatches) <- withElapsedTime $ do
@@ -163,8 +167,9 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
       (pushTime, cohortsExecutionDetails) <- withElapsedTime
         $ A.forConcurrently operations
         $ \(res, cohortId, respData, snapshot) -> do
-          (pushedSubscribers, ignoredSubscribers) <-
+          (changed, (pushedSubscribers, ignoredSubscribers)) <-
             pushResultToCohort prometheusMetrics res (fst <$> respData) lqMeta snapshot
+          for_ respData $ addCohortResultBytes resultBytes changed . snd
           pure
             CohortExecutionDetails
               { _cedCohortId = cohortId,
@@ -216,11 +221,14 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
             }
   postPollHook pollDetails
   operationLabels <- pollOperationLabels prometheusMetrics operationNamesMap
+  (changedResultBytes, unchangedResultBytes) <- readIORef resultBytes
   recordPollByOperation prometheusMetrics liveQuerySubscriptionLabel operationLabels
     $ PollByOperation
       { pboPollerId = unPollerId pollerId,
         pboFailedBatches = length (catMaybes maybeErrors),
-        pboCohorts = sum (map (length . _bedCohorts) batchesDetails)
+        pboCohorts = sum (map (length . _bedCohorts) batchesDetails),
+        pboChangedResultBytes = changedResultBytes,
+        pboUnchangedResultBytes = unchangedResultBytes
       }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   modelInfoLogStatus' <- modelInfoLogStatus

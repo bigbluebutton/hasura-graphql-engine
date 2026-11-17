@@ -309,6 +309,13 @@ always on.
     callback, so they can exceed what the client receives when the websocket transport drops the
     message: an operation already stopped (`onChange`, `Hasura.GraphQL.Transport.WebSocket`), as
     after a resend on a reconnection, or a full send queue.
+  - `hasura_subscription_result_bytes_total` counts the bytes of each cohort's result returned
+    by the database, whether or not it is pushed, with `changed` as above. A result is one per
+    cohort, not per subscriber, so the poll's bytes are split among the operations the poller
+    serves in proportion to their subscribers (`splitBySubscribers`: integer division, the
+    remainder to the operation with the most subscribers, the greatest label among equals), and
+    the operations' parts add up to the poll's bytes. `changed="false"` here is the poll's
+    waste: results the database returned that went to no one but new subscribers.
 
 ## Formatting
 

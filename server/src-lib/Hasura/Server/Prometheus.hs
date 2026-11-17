@@ -56,6 +56,8 @@ module Hasura.Server.Prometheus
     forgetPollerByOperation,
     registerPollerByOperation,
     recordPushByOperation,
+    splitBySubscribers,
+    addCohortResultBytes,
     SubscriptionChangedLabel (..),
     unnamedOperationLabel,
     otherOperationLabel,
@@ -300,7 +302,10 @@ data SubscriptionMetrics = SubscriptionMetrics
     -- | Results pushed to subscribers, by each subscriber's operation.
     submSubscribersServed :: CounterVector SubscriptionChangedLabel,
     -- | Bytes of the results pushed to subscribers, by each subscriber's operation.
-    submSentBytes :: CounterVector SubscriptionChangedLabel
+    submSentBytes :: CounterVector SubscriptionChangedLabel,
+    -- | Bytes of the cohorts' results returned by the database, split among the operations of
+    -- the poller in proportion to their subscribers.
+    submResultBytes :: CounterVector SubscriptionChangedLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -414,6 +419,7 @@ makeDummySubscriptionMetrics = do
   submActivePollersByOperation <- GaugeVector.new
   submSubscribersServed <- CounterVector.new
   submSentBytes <- CounterVector.new
+  submResultBytes <- CounterVector.new
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -603,7 +609,11 @@ data PollByOperation = PollByOperation
     -- | the poll's batches that failed
     pboFailedBatches :: Int,
     -- | the cohorts the poll processed
-    pboCohorts :: Int
+    pboCohorts :: Int,
+    -- | bytes of the cohorts' results returned by the database, of the cohorts whose result
+    -- changed and of those whose result did not
+    pboChangedResultBytes :: Int64,
+    pboUnchangedResultBytes :: Int64
   }
 
 -- | Record a poll in the per-operation metrics of the operations the poller serves. These are
@@ -615,6 +625,12 @@ recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMet
     CounterVector.inc submPollsByOperation label
     when (pboFailedBatches > 0) $ CounterVector.add submPollErrorsByOperation label (fromIntegral pboFailedBatches)
     CounterVector.add submCohortsProcessedByOperation label (fromIntegral pboCohorts)
+  -- Amounts, unlike events, are split so that the operations' parts add up to the poll's.
+  let addSplit vector changed amount =
+        for_ (splitBySubscribers amount operations) \(operation, part) ->
+          when (part > 0) $ CounterVector.add vector (SubscriptionChangedLabel (SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation))) changed) (fromIntegral part)
+  addSplit submResultBytes True pboChangedResultBytes
+  addSplit submResultBytes False pboUnchangedResultBytes
   -- The gauge gets only the difference from what this poller added at its last poll: an
   -- operation the poller no longer serves drops its share. A poll that ends after its poller was
   -- removed (and so forgotten) changes nothing.
@@ -638,6 +654,30 @@ recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMet
 registerPollerByOperation :: PrometheusMetrics -> UUID -> IO ()
 registerPollerByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} pollerId =
   atomicModifyIORef' submReportedCohorts \byPoller -> (HashMap.insert pollerId mempty byPoller, ())
+
+-- | Adds the bytes of a cohort's result returned by the database to a poll's count, to the
+-- changed (first) or unchanged (second) bytes.
+addCohortResultBytes :: IORef (Int64, Int64) -> Bool -> Int -> IO ()
+addCohortResultBytes resultBytes changed size =
+  -- Both fields are forced, as atomicModifyIORef' only forces the pair.
+  atomicModifyIORef' resultBytes \(changedBytes, unchangedBytes) ->
+    let !changedBytes' = if changed then changedBytes + fromIntegral size else changedBytes
+        !unchangedBytes' = if changed then unchangedBytes else unchangedBytes + fromIntegral size
+     in ((changedBytes', unchangedBytes'), ())
+
+-- | Splits an amount among operations in proportion to their subscribers, by integer division.
+-- The remainder goes to the operation with the most subscribers (the greatest label among
+-- equals), so the parts add up to the amount.
+splitBySubscribers :: Int64 -> HashMap OperationNameLabel Int -> [(OperationNameLabel, Int64)]
+splitBySubscribers amount operations
+  | total <= 0 = []
+  | otherwise = [(operation, part + if operation == largest then remainder else 0) | (operation, part) <- parts]
+  where
+    entries = HashMap.toList operations
+    total = fromIntegral (sum (map snd entries)) :: Int64
+    parts = [(operation, amount * fromIntegral subscribers `div` total) | (operation, subscribers) <- entries]
+    remainder = amount - sum (map snd parts)
+    largest = snd (maximum [(subscribers, operation) | (operation, subscribers) <- entries])
 
 -- | Take out of the per-operation gauges what a removed poller added to them, and forget the
 -- poller, so that a poll of it still running cannot add to them again.
@@ -1012,6 +1052,12 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Total number of bytes of subscription results pushed to subscribers"
       'CounterType
       SubscriptionChangedLabel
+  SubscriptionResultBytesTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_result_bytes_total"
+      "Total number of bytes of subscription results returned by the database"
+      'CounterType
+      SubscriptionChangedLabel
   ActiveSubscriptionPollersByOperation ::
     PrometheusMetricsSpec
       "hasura_active_subscription_pollers_by_operation"
@@ -1258,6 +1304,7 @@ makeSubscriptionMetrics store = do
   submActivePollersByOperation <- createGaugeVector ActiveSubscriptionPollersByOperation store OrdMap.toList
   submSubscribersServed <- createCounterVector SubscriptionSubscribersServedTotal store OrdMap.toList
   submSentBytes <- createCounterVector SubscriptionSentBytesTotal store OrdMap.toList
+  submResultBytes <- createCounterVector SubscriptionResultBytesTotal store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

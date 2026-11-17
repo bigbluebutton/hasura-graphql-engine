@@ -13,6 +13,7 @@
 -- dynamic group registration would not reject.
 module Hasura.Server.PrometheusSpec (spec) where
 
+import Control.Exception (evaluate)
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
 import Data.HashMap.Strict qualified as HashMap
@@ -22,6 +23,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.UUID qualified as UUID
 import Database.PG.Query qualified as PG
+import GHC.AssertNF (isNF)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Common (defaultSource)
@@ -44,7 +46,9 @@ spec = do
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
   postgresPoolObserverSpec
+  splitBySubscribersSpec
   cohortsGaugeSpec
+  addCohortResultBytesSpec
 
 -- | The per-operation cohorts gauge follows the pollers from their registration to their removal.
 cohortsGaugeSpec :: Spec
@@ -52,7 +56,7 @@ cohortsGaugeSpec = describe "the active cohorts by operation" $ do
   it "counts a registered poller's cohorts, takes them out on removal and ignores a later poll" $ do
     metrics <- makeDummyPrometheusMetrics
     let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f01")
-        report = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 3)
+        report = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 3 0 0)
         gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
     report
     unregistered <- gauge
@@ -68,7 +72,7 @@ cohortsGaugeSpec = describe "the active cohorts by operation" $ do
   it "leaves the gauge as it is on a repeated report, and moves it on a changed one" $ do
     metrics <- makeDummyPrometheusMetrics
     let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f02")
-        report cohorts = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 cohorts)
+        report cohorts = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 cohorts 0 0)
         gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
     registerPollerByOperation metrics pollerId
     report 3
@@ -77,6 +81,34 @@ cohortsGaugeSpec = describe "the active cohorts by operation" $ do
     report 5
     changed <- gauge
     (repeated, changed) `shouldBe` ([3], [5])
+
+-- | The bytes of a poll's cohorts are kept evaluated, not as a chain of additions.
+addCohortResultBytesSpec :: Spec
+addCohortResultBytesSpec = describe "addCohortResultBytes" $ do
+  it "adds a cohort's bytes to the changed or unchanged count, both evaluated" $ do
+    resultBytes <- newIORef (0, 0)
+    addCohortResultBytes resultBytes True 100
+    addCohortResultBytes resultBytes False 30
+    addCohortResultBytes resultBytes True 5
+    -- The reference holds a selector thunk of atomicModifyIORef'; evaluating it gives the pair,
+    -- whose fields are checked before anything else looks at them (which would evaluate them).
+    counts <- evaluate =<< readIORef resultBytes
+    isNF counts `shouldReturn` True
+    counts `shouldBe` (105, 30)
+
+-- | Amounts of a poll split among the operations of its poller.
+splitBySubscribersSpec :: Spec
+splitBySubscribersSpec = describe "splitBySubscribers" $ do
+  let label = OperationNameLabel
+      split amount operations = sort (splitBySubscribers amount (HashMap.fromList [(label name, n) | (name, n) <- operations]))
+  it "splits in proportion to the subscribers, with the remainder to the operation with the most" $ do
+    split 10 [("A", 2), ("B", 1)] `shouldBe` [(label "A", 7), (label "B", 3)]
+  it "gives the remainder to the greatest label among the operations with the most subscribers" $ do
+    split 3 [("A", 1), ("B", 1)] `shouldBe` [(label "A", 1), (label "B", 2)]
+  it "keeps the sum of the parts equal to the amount" $ do
+    sum (map snd (split 1000003 [("A", 7), ("B", 13), ("C", 1)])) `shouldBe` 1000003
+  it "splits nothing among no operations" $ do
+    split 10 [] `shouldBe` []
 
 -- | The observer of a pool records under the pool's label: "(metadata)" or the source name.
 postgresPoolObserverSpec :: Spec
@@ -333,6 +365,7 @@ observeEveryVectorOnce metrics = do
   GaugeVector.inc (submActivePollersByOperation subm) subLabel
   CounterVector.inc (submSubscribersServed subm) (SubscriptionChangedLabel subLabel True)
   CounterVector.inc (submSentBytes subm) (SubscriptionChangedLabel subLabel True)
+  CounterVector.inc (submResultBytes subm) (SubscriptionChangedLabel subLabel True)
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -395,6 +428,7 @@ expectedTypeLines =
       "# TYPE hasura_active_subscription_pollers_by_operation gauge",
       "# TYPE hasura_subscription_subscribers_served_total counter",
       "# TYPE hasura_subscription_sent_bytes_total counter",
+      "# TYPE hasura_subscription_result_bytes_total counter",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

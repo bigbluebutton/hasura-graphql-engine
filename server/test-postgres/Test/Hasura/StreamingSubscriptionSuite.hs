@@ -934,6 +934,34 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         it "the bytes sent are the bytes each subscriber received" $ do
           sent `shouldBe` [("First", True, receivedBy ["a", "b"]), ("Second", True, receivedBy ["c"])]
 
+      describe "result bytes returned by the database" $ do
+        -- Cohorts {a, c}, {b} and the sentinel's; the operations have 2 (First), 1 (Second) and 1
+        -- (Sentinel) subscribers. Two polls: the cursors advance, so a and b get a new row each
+        -- time, while the sentinel's empty result repeats on the second poll.
+        (changedBytes, unchangedBytes, received) <- runIO do
+          OpScenario {..} <- newOpScenario
+          _ <- osJoin (op "First") "a" 1
+          _ <- osJoin (op "First") "b" 2
+          _ <- osJoin (op "Second") "c" 1
+          osPoll Nothing
+          osPoll Nothing
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+          values <- CounterVector.read submResultBytes
+          let byName changedWanted = sort [(name, value) | (SubscriptionChangedLabel (SubscriptionLabel _ (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) changed, value) <- Map.toList values, changed == changedWanted]
+          result <- (byName True,byName False,) <$> osReceived
+          osStop
+          pure result
+        let emptyResult = B.length "{\"numbers_stream\" : []}"
+            -- a and b are in different cohorts, so their results are the cohorts' results.
+            cohortsResults = sum [bytes | (subscriber, bytes) <- received, subscriber `elem` ["a", "b"]]
+        it "the bytes of the changed results add up to the cohorts' results, split by subscribers" $ do
+          sum (map snd changedBytes) `shouldBe` fromIntegral (cohortsResults + emptyResult)
+          map fst changedBytes `shouldBe` ["First", "Second", "Sentinel"]
+        it "a result that repeats counts as unchanged, split 2:1:1 with the remainder to the largest" $ do
+          -- 23 bytes: 11, 5 and 5, and the remaining 2 to First.
+          emptyResult `shouldBe` 23
+          unchangedBytes `shouldBe` [("First", 13), ("Second", 5), ("Sentinel", 5)]
+
       describe "a live query poll" $ do
         -- Two subscribers of LiveOp in one cohort of a live query poller, whose thread is stopped,
         -- and one poll run here. They are added with other metrics than the poll, so that the
