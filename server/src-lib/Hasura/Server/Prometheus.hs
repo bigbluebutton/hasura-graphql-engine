@@ -59,6 +59,7 @@ module Hasura.Server.Prometheus
     splitBySubscribers,
     wholeMicroseconds,
     observePollStart,
+    observeSubscriptionInitTime,
     addCohortResultBytes,
     SubscriptionChangedLabel (..),
     unnamedOperationLabel,
@@ -315,7 +316,9 @@ data SubscriptionMetrics = SubscriptionMetrics
     submDBExecutionMicroseconds :: CounterVector SubscriptionLabel,
     submTotalTimeMicroseconds :: CounterVector SubscriptionLabel,
     -- | Time between the starts of consecutive polls of a poller.
-    submPollInterval :: HistogramVector.HistogramVector SubscriptionKindLabel
+    submPollInterval :: HistogramVector.HistogramVector SubscriptionKindLabel,
+    -- | Time from a subscription's start message until its poller has it.
+    submInitTime :: HistogramVector.HistogramVector SubscriptionKindLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -433,6 +436,7 @@ makeDummySubscriptionMetrics = do
   submDBExecutionMicroseconds <- CounterVector.new
   submTotalTimeMicroseconds <- CounterVector.new
   submPollInterval <- HistogramVector.new []
+  submInitTime <- HistogramVector.new []
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -692,6 +696,11 @@ observePollStart PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics 
   start <- getMonotonicTime
   previous <- atomicModifyIORef' previousStart (Just start,)
   for_ previous \previousTime -> HistogramVector.observe submPollInterval kind (start - previousTime)
+
+-- | Observes the time a subscription took to start, since its start message arrived.
+observeSubscriptionInitTime :: PrometheusMetrics -> SubscriptionKindLabel -> DiffTime -> IO ()
+observeSubscriptionInitTime PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind sinceStart =
+  HistogramVector.observe submInitTime kind (realToFrac sinceStart)
 
 -- | A time in whole microseconds (truncated).
 wholeMicroseconds :: DiffTime -> Int64
@@ -1042,6 +1051,12 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Time between the starts of consecutive polls of a subscription poller, in seconds"
       'HistogramType
       SubscriptionKindLabel
+  SubscriptionInitTimeSeconds ::
+    PrometheusMetricsSpec
+      "hasura_subscription_init_time_seconds"
+      "Time taken to start a subscription, from the start message until its poller accepts it, in seconds"
+      'HistogramType
+      SubscriptionKindLabel
   SubscriptionTotalTimeSeconds ::
     PrometheusMetricsSpec
       "hasura_subscription_total_time_seconds"
@@ -1360,6 +1375,7 @@ makeSubscriptionMetrics store = do
   submDBExecutionMicroseconds <- createCounterVector SubscriptionDBExecutionSecondsTotal store microsecondsToSeconds
   submTotalTimeMicroseconds <- createCounterVector SubscriptionTotalTimeSecondsTotal store microsecondsToSeconds
   submPollInterval <- createHistogramVector pollAndPoolTimeBuckets SubscriptionPollIntervalSeconds store OrdMap.toList
+  submInitTime <- createHistogramVector pollAndPoolTimeBuckets SubscriptionInitTimeSeconds store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).
@@ -1376,10 +1392,10 @@ eventProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
 eventWebhookProcessingTimeBuckets :: [Histogram.UpperBound]
 eventWebhookProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10]
 
--- | Buckets for the subscription poll times (total and database), the time between polls and
--- the two Postgres pool times (the wait for a connection and opening a connection). They resolve
--- the poll intervals in use (150 ms for streaming, 333 ms for live queries) and the range up to
--- 30 s.
+-- | Buckets for the subscription poll times (total and database), the time between polls, the
+-- time to start a subscription and the two Postgres pool times (the wait for a connection and
+-- opening a connection). They resolve the poll intervals in use (150 ms for streaming, 333 ms
+-- for live queries) and the range up to 30 s.
 pollAndPoolTimeBuckets :: [Histogram.UpperBound]
 pollAndPoolTimeBuckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.333, 0.5, 0.75, 1, 2.5, 5, 10, 30]
 

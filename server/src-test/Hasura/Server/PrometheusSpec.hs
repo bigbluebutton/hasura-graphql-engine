@@ -239,7 +239,8 @@ pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time 
         "hasura_subscription_db_execution_time_seconds",
         "hasura_postgres_pool_wait_time_seconds",
         "hasura_postgres_connection_init_time_seconds",
-        "hasura_subscription_poll_interval_seconds"
+        "hasura_subscription_poll_interval_seconds",
+        "hasura_subscription_init_time_seconds"
       ]
       \family -> (family, upperBoundsOf family) `shouldBe` (family, expected)
 
@@ -308,6 +309,17 @@ operationNameSeriesSpec = describe "operation_name series" $ do
     map (T.isInfixOf "operation_name=\"getUsers\"") (seriesOf "hasura_graphql_requests_total") `shouldBe` [True]
     seriesOf "hasura_subscription_total_time_seconds_count" `shouldBe` ["hasura_subscription_total_time_seconds_count{subscription_kind=\"streaming\"} 1"]
     filter (T.isInfixOf "parameterized_query_hash") (T.lines rendered) `shouldBe` []
+  it "observe the time to start a subscription, by kind, since its start message" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    observeSubscriptionInitTime metrics liveQuerySubscriptionLabel 0.04
+    observeSubscriptionInitTime metrics streamingSubscriptionLabel 0.3
+    rendered <- renderSample metrics
+    let seriesOf family = [line | line <- T.lines rendered, (family <> "{") `T.isPrefixOf` line]
+    seriesOf "hasura_subscription_init_time_seconds_sum"
+      `shouldBe` [ "hasura_subscription_init_time_seconds_sum{subscription_kind=\"live-query\"} 4.0e-2",
+                   "hasura_subscription_init_time_seconds_sum{subscription_kind=\"streaming\"} 0.3"
+                 ]
   it "observe the time between two poll starts, and nothing at a poller's first poll" $ do
     metrics <- makeDummyPrometheusMetrics
     previousStart <- newIORef Nothing
@@ -394,6 +406,7 @@ observeEveryVectorOnce metrics = do
   CounterVector.inc (submDBExecutionMicroseconds subm) subLabel
   CounterVector.inc (submTotalTimeMicroseconds subm) subLabel
   HistogramVector.observe (submPollInterval subm) streamingSubscriptionLabel 0.2
+  HistogramVector.observe (submInitTime subm) streamingSubscriptionLabel 0.2
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -460,6 +473,7 @@ expectedTypeLines =
       "# TYPE hasura_subscription_db_execution_seconds_total counter",
       "# TYPE hasura_subscription_total_time_seconds_total counter",
       "# TYPE hasura_subscription_poll_interval_seconds histogram",
+      "# TYPE hasura_subscription_init_time_seconds histogram",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

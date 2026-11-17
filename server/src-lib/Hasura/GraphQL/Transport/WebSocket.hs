@@ -2,7 +2,8 @@
 -- guards subscription pushes with a per-operation liveness flag instead of an opMap lookup,
 -- so the first live query result is not dropped when the poller runs before the operation
 -- is registered (https://github.com/hasura/graphql-engine/issues/10952); labels the GraphQL
--- request counter by operation name, always, without the query hash. See BBB-CHANGES.md.
+-- request counter by operation name, always, without the query hash; observes the time to start
+-- a subscription. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | This file contains the handlers that are used within websocket server.
@@ -110,7 +111,10 @@ import Hasura.Server.Prometheus
   ( GraphQLRequestMetrics (..),
     PrometheusMetrics (..),
     ResponseStatus (..),
+    liveQuerySubscriptionLabel,
+    observeSubscriptionInitTime,
     recordGraphqlOperationMetric,
+    streamingSubscriptionLabel,
   )
 import Hasura.Server.Telemetry.Counters qualified as Telem
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), HeaderPrecedence, ModelInfoLogState (..), MonadGetPolicies (..), RedactActionHandlerLogsStatus, RemoteSchemaResponsePriority, RequestId, TraceQueryStatus (TraceQueryEnabled), getRequestId)
@@ -726,6 +730,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
           modelInfoLogStatus'' <- runGetModelInfoLogStatus
           opMetadataE <- liftIO $ startLiveQuery opName liveQueryBuilder parameterizedQueryHash requestId actionLogMap granularPrometheusMetricsState modifier modelInfoLogStatus''
           lqId <- onLeft opMetadataE (withComplete . preExecErr granularPrometheusMetricsState requestId (Just gqlOpType) opName (Just parameterizedQueryHash))
+          timerTot >>= liftIO . observeSubscriptionInitTime prometheusMetrics liveQuerySubscriptionLabel
           -- Update async action query subscription state
           case NE.nonEmpty (toList actionIds) of
             Nothing -> do
@@ -752,6 +757,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
         E.SEOnSourceDB (E.SSStreaming rootFieldName streamQueryBuilder) -> do
           modelInfoLogStatus'' <- runGetModelInfoLogStatus
           liftIO $ startStreamingQuery rootFieldName streamQueryBuilder parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus''
+          timerTot >>= liftIO . observeSubscriptionInitTime prometheusMetrics streamingSubscriptionLabel
 
       recordGraphqlOperationMetric
         prometheusMetrics

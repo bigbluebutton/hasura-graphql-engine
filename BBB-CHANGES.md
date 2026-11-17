@@ -331,6 +331,13 @@ always on.
   `Hasura.GraphQL.Execute.Subscription.State`), the time between the start of a poll and the
   start of the next one: the poll itself plus the refetch interval. The first poll of a poller
   has no previous one and is not observed. It uses the poll time buckets.
+- `hasura_subscription_init_time_seconds{subscription_kind}` observes, in `onStart`
+  (`Hasura.GraphQL.Transport.WebSocket`), the time from the start message until the
+  subscription is in its poller and registered on the connection: the plan, the async action
+  lookup for a live query, and `addLiveQuery` or `addStreamSubscriptionQuery`. A subscription
+  that fails to start is not observed, nor is the restart of a live query when its async actions
+  change. It uses the poll time buckets. `observeSubscriptionInitTime` is tested on its own; its
+  call in `onStart` has no automated test, since no test here drives a websocket connection.
 
 ## Formatting
 
