@@ -339,6 +339,42 @@ always on.
   change. It uses the poll time buckets. `observeSubscriptionInitTime` is tested on its own; its
   call in `onStart` has no automated test, since no test here drives a websocket connection.
 
+## Benchmark of the subscription metrics
+
+`server/bench-subscription-metrics` (the `subscription-metrics` benchmark of the
+`graphql-engine` package, with criterion, as `ekg-prometheus` has for its counters) measures:
+
+- `export`: rendering the whole Prometheus export with every per-operation series of 0 to 1,000
+  operation names at the default operation name limit (past 500 the names become `(other)`),
+  and of 10,000 names at a limit of 10,000, for both kinds; it prints the size of each export;
+- `poll metrics`: the work the per-operation metrics add to a poll, on its own, without a
+  database: for each of 1,000 cohorts, its push to 5 subscribers of 10 operation names and its
+  result bytes, then the poll's record;
+- `poll`: one streaming poll of a poller with 1,000 cohorts of 5 subscribers each, of 10
+  operation names, against the database at `HASURA_GRAPHQL_DATABASE_URL` (a table of 2,000,000
+  rows it creates), with results that change at every poll and with empty results. The poll
+  benchmark only uses functions whose signatures predate the per-operation metrics, so the same
+  file builds on an earlier commit to compare.
+
+The benchmark turns the heap checks of `assertNFHere` off, as the server does at startup.
+
+Export, measured on the 16-core test VM with a release build (the optimization of
+`cabal.project`, `-O2`, as `scripts/build-v2.sh` builds it), with every per-operation series
+of each name, for both kinds (the worst case: a name has one kind in practice); the time is
+the range of two runs:
+
+| Names | Limit | Export time | Size |
+|---|---|---|---|
+| 0 | 500 | 0.25-0.31 ms | 8.9 KB |
+| 10 | 500 | 1.4-1.5 ms | 44 KB |
+| 100 | 500 | 15-20 ms | 346 KB |
+| 500 | 500 (the default) | 100-105 ms | 1.7 MB |
+| 1,000 (500 of them become `(other)`) | 500 | 109-122 ms | 1.7 MB |
+| 10,000 | 10,000 | 2.1-2.4 s | 34 MB |
+
+Raising the limit raises the cost of a scrape in proportion to the names admitted: 10,000
+names export 20 times the bytes of 500, in about 21 times the time.
+
 ## Formatting
 
 `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
@@ -448,5 +484,8 @@ Every file below carries a modification notice at the top, as required by Apache
   `server/src-test/Hasura/GraphQL/Execute/Subscription/Poll/LiveQuerySpec.hs` (new file) and
   `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`; `LiveQuery` exports
   `pushResultToCohort` for its test, and `server/graphql-engine.cabal` registers the test module.
+- `server/graphql-engine.cabal`: also registers the `subscription-metrics` benchmark
+  (`server/bench-subscription-metrics/Main.hs`, new file; see "Benchmark of the subscription
+  metrics" above).
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.
