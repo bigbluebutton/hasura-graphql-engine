@@ -139,6 +139,9 @@ metrics on and once per poll with them off, so the `_count` of
 `hasura_subscription_total_time_seconds` is the number of polls and the `_count` of
 `hasura_subscription_db_execution_time_seconds` the number of batches (that ran a query,
 see the next section).
+Since "Per-operation subscription metrics" below, the two histograms are labeled only by
+`subscription_kind` and observed once per poll and once per batch that ran a query, whatever
+the granularity setting; `recordSubscriptionMetric` is gone.
 
 ## Subscription database time without the pool wait
 
@@ -228,6 +231,56 @@ source keeps adding to the same series.
   also counts as `lifetime`. The bundled `resource-pool` is not changed, so the cause of a
   close cannot be told apart.
 
+## Per-operation subscription metrics
+
+The per-operation series replace the label of the parameterized query hash, which changes with
+the query text and so cannot compare one operation across builds, with the operation's name,
+always on.
+
+- **Operation name labels.** Every series that names an operation carries `operation_name`
+  whatever the granularity setting, which the community edition fixes to off
+  (`runGetPrometheusMetricsGranularity` in `Hasura.App`): `hasura_active_subscriptions`,
+  `hasura_graphql_requests_total` and
+  `hasura_websocket_messages_sent_bytes_total`. No series carries `parameterized_query_hash`.
+  The value comes from `operationNameLabel`: the name itself for the first distinct names
+  of up to 128 characters, up to the operation name limit, `(other)` for any other, `(unnamed)`
+  for an operation without a name, so a client cannot create series at will. The limit is 500
+  by default, configurable with `HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT` (or
+  `--metrics-operation-name-limit`), read once at start; a value that is not a positive
+  integer refuses the start, as the other positive integer options do. The 128 characters are
+  fixed. bbb-graphql-middleware has the same cap, `prometheus_operation_name_limit` in its
+  `config.yml`: the two should be changed together, so that the counts by name of the engine
+  and of the middleware stay comparable. The option has no
+  maximum: the memory held until a restart and the time and size of a scrape grow in
+  proportion to the names admitted; with 10,000 names the export took 2.1 to 2.4 s and 34 MB
+  in the benchmark below, on a release build, against the default Prometheus scrape timeout
+  of 10 s. The effective limit is logged at start with the
+  serve options (`metrics_operation_name_limit`). A request that fails does not admit its
+  name: it is labeled by its name only if the name was already admitted, and `(other)` if not.
+  The residual risk: an authenticated client can still fill the cap with valid names, and the
+  symptom is `(other)` growing while new real names no longer get their own series; the cure is
+  a restart. The admitted names and their series are never dropped while the server runs, even
+  after the operations end.
+  `hasura_websocket_messages_sent_bytes_total` carries it for the data messages of an
+  operation; every other message (acknowledgements, keepalives, and an operation's error and
+  complete) stays in the unlabeled series, which is no longer the total: the total needs
+  `sum`.
+- **Histograms by kind only.** `hasura_subscription_total_time_seconds` and
+  `hasura_subscription_db_execution_time_seconds` are labeled only by `subscription_kind`. The
+  first is observed once per poll and the second once per batch that ran a query; upstream
+  observed each once
+  for every operation name the poller served, so their counts overstated polls and batches
+  (see "One observation per subscription poll" above).
+
+## Formatting
+
+`server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
+`server/src-lib/Hasura/GraphQL/Transport/WebSocket/Server.hs` are not ormolu-clean upstream with the
+ormolu of `server/VERSIONS.json`, so for these two files the rule is no new ormolu violation
+relative to the base commit `391cf8372c` (the lines ormolu would rewrite are the same as in the
+base, or fewer), to keep the diff against upstream minimal; every other file passes
+`ormolu --mode check`.
+
 ## Modified upstream files
 
 Every file below carries a modification notice at the top, as required by Apache License
@@ -238,18 +291,27 @@ Every file below carries a modification notice at the top, as required by Apache
   mutable references as `makeDummyPrometheusMetrics`, registered to a store), plus a
   `pmSample` field to sample the store.
 - `server/src-exec/Main.hs`: creates the Prometheus metric store and calls
-  `makePrometheusMetrics` instead of `makeDummyPrometheusMetrics`.
+  `makePrometheusMetricsWithOperationNameLimit`, with the configured operation name limit,
+  instead of `makeDummyPrometheusMetrics`.
 - `server/src-lib/Hasura/Server/App.hs`: adds the `GET /v1/metrics` endpoint.
 - `server/src-lib/Hasura/Server/Prometheus/EkgExport.hs` (new file): the EKG-to-Prometheus
   text conversion.
 - `server/src-lib/Hasura/Server/Init/Arg/Command/Serve.hs`,
   `server/src-lib/Hasura/Server/Init.hs`, `server/src-lib/Hasura/Server/Init/Config.hs`,
   `server/src-lib/Hasura/App/State.hs`: add the `HASURA_GRAPHQL_METRICS_SECRET` option and
-  carry it into the app context.
-- `server/src-test/Hasura/Server/InitSpec.hs`: adds the new raw serve option default, and
-  tests that the metrics secret is read hashed and that an empty one counts as not set.
+  carry it into the app context. The first three also add the
+  `HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT` option (see "Operation name labels" above),
+  which `server/src-exec/Main.hs` passes to the metrics.
+- `server/src-lib/Hasura/Server/Init/Logging.hs`: logs the operation name limit with the
+  serve options.
+- `server/src-test/Hasura/Server/InitSpec.hs`: adds the new raw serve option defaults, and
+  tests that the metrics secret is read hashed and that an empty one counts as not set, and
+  the operation name limit's default, its environment variable, that a parsed argument wins
+  over it, and that a value that is not a positive integer is refused.
+- `server/src-test/Hasura/Server/Init/ArgSpec.hs`: tests that the
+  `--metrics-operation-name-limit` argument accepts a positive integer and refuses 0.
 - `server/test-postgres/Constants.hs` and `server/lib/test-harness/src/Harness/Constants.hs`:
-  add the new serve option default to the test fixtures.
+  add the new serve option defaults to the test fixtures.
 - `server/src-test/Hasura/Server/PrometheusSpec.hs` (new file): tests that every metric
   registers without a `RegistrationError` and that the store exports exactly the expected
   metric families once every vector metric has been observed.
@@ -273,11 +335,12 @@ Every file below carries a modification notice at the top, as required by Apache
   vacuously.
 - `server/src-lib/Hasura/GraphQL/Execute.hs`: builds the streaming subscription plan once
   (see "Streaming subscription plan built once" above).
-- `server/src-lib/Hasura/Server/Prometheus.hs`: `recordSubscriptionMetric` observes a poll
-  once when granular metrics are off (see "One observation per subscription poll" above).
+- `server/src-lib/Hasura/Server/Prometheus.hs`: observes a subscription poll once (see "One
+  observation per subscription poll" above), by subscription kind only since "Per-operation
+  subscription metrics" above.
 - `server/src-test/Hasura/Server/PrometheusSpec.hs` and
   `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`: test the subscription
-  poll observations, with and without granular metrics.
+  poll observations.
 - `server/src-lib/Hasura/Backends/Postgres/Instances/Transport.hs`: times subscription
   queries inside the transaction (see "Subscription database time without the pool wait"
   above), and exports `withQueryExecutionTime` for its test.
@@ -309,5 +372,12 @@ Every file below carries a modification notice at the top, as required by Apache
 - `server/graphql-engine.cabal`: also registers the new test module.
 - `server/src-test/Hasura/Server/VersionSpec.hs`: tests the version form of a test build
   (see `scripts/build-v2.sh` above).
+- `server/src-lib/Hasura/Server/Prometheus.hs`, `server/src-lib/Hasura/GraphQL/Execute/Subscription/State.hs`,
+  `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/LiveQuery.hs`,
+  `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/StreamingQuery.hs`,
+  `server/src-lib/Hasura/GraphQL/Transport/HTTP.hs`, `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
+  `server/src-lib/Hasura/GraphQL/Transport/WebSocket/Server.hs`: the per-operation subscription metrics (see
+  "Per-operation subscription metrics" above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs` and
+  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

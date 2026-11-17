@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- labels the websocket bytes sent by operation name, always, without the query hash. See BBB-CHANGES.md.
 {-# LANGUAGE NondecreasingIndentation #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -76,11 +78,11 @@ import Hasura.Server.Init.Config (AllowListStatus (..), WSConnectionInitTimeout 
 import Hasura.Server.Prometheus
   ( DynamicGraphqlOperationLabel (..),
     PrometheusMetrics (..),
-    recordMetricWithLabel,
+    operationNameLabel,
     pmWebsocketMsgDropped,
     pmWebsocketMsgQueued,
   )
-import Hasura.Server.Types (ExperimentalFeature (..), MonadGetPolicies (runGetPrometheusMetricsGranularity))
+import Hasura.Server.Types (ExperimentalFeature (..))
 import ListT qualified
 import Network.Wai.Extended (IpAddress)
 import Network.Wai.Handler.Warp qualified as Warp
@@ -584,7 +586,7 @@ websocketConnectionReaper getLatestConfig getSchemaCache ws@(WSServer _ userConf
 
 -- | This is called for each client websocket connection
 createServerApp ::
-  (MonadIO m, MC.MonadBaseControl IO m, LA.Forall (LA.Pure m), MonadWSLog m, MonadGetPolicies m) =>
+  (MonadIO m, MC.MonadBaseControl IO m, LA.Forall (LA.Pure m), MonadWSLog m) =>
   IO MetricsConfig ->
   WSConnectionInitTimeout ->
   Refined Positive Int ->
@@ -755,18 +757,11 @@ createServerApp getMetricsConfig wsConnInitTimeout wsQueueSize (WSServer logger@
                     (messageWriteTime, _) <- liftIO $ withElapsedTime $ WS.sendTextData conn msg
                     let messageLength = BL.length msg
                         messageDetails = MessageDetails (SB.fromLBS msg) messageLength
-                        parameterizedQueryHash = wsInfo >>= _wseiParameterizedQueryHash
-                        operationName = wsInfo >>= _wseiOperationName
-                        promMetricGranularLabel = DynamicGraphqlOperationLabel parameterizedQueryHash operationName
-                        promMetricLabel = DynamicGraphqlOperationLabel Nothing Nothing
                         websocketBytesSentMetric = pmWebSocketBytesSent prometheusMetrics
-                    granularPrometheusMetricsState <- runGetPrometheusMetricsGranularity
                     liftIO $ do
-                      recordMetricWithLabel
-                        granularPrometheusMetricsState
-                        True
-                        (CounterVector.add websocketBytesSentMetric promMetricGranularLabel messageLength)
-                        (CounterVector.add websocketBytesSentMetric promMetricLabel messageLength)
+                      -- A message of an operation is labeled with the operation's name.
+                      label <- for wsInfo \info -> DynamicGraphqlOperationLabel <$> operationNameLabel prometheusMetrics (_wseiOperationName info)
+                      CounterVector.add websocketBytesSentMetric label messageLength
                       Prometheus.Histogram.observe
                         (pmWebsocketMsgQueueTimeSeconds prometheusMetrics)
                         messageQueueTime

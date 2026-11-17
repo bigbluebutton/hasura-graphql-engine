@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- labels the GraphQL request counter by operation name, always, without the query hash. See BBB-CHANGES.md.
+
 -- | Execution of GraphQL queries over HTTP transport
 module Hasura.GraphQL.Transport.HTTP
   ( MonadExecuteQuery (..),
@@ -629,17 +632,16 @@ runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority header
       Maybe ParameterizedQueryHash ->
       n a ->
       n a
-    observeGQLQueryError granularPrometheusMetricsState gqlMetrics mOpType mGetTimeElapsed mOpName mQHash action =
+    observeGQLQueryError _granularPrometheusMetricsState gqlMetrics mOpType mGetTimeElapsed mOpName _mQHash action =
       catchError (fmap Right action) (pure . Left) >>= \case
         Right result ->
           pure result
         Left err -> do
           recordGraphqlOperationMetric
-            granularPrometheusMetricsState
+            prometheusMetrics
             mOpType
             Failed
             mOpName
-            mQHash
             (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
           -- Make a best effort to record latency timings, like in recordGQLQuerySuccess,
           -- even in the event of failure. Important for monitoring.
@@ -654,13 +656,12 @@ runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority header
     -- Tally and record execution times for successful GraphQL requests.
     recordGQLQuerySuccess ::
       IO GranularPrometheusMetricsState -> GraphQLRequestMetrics -> DiffTime -> Maybe OperationName -> ParameterizedQueryHash -> G.OperationType -> IO ()
-    recordGQLQuerySuccess granularPrometheusMetricsState gqlMetrics totalTime opName qHash opType = do
+    recordGQLQuerySuccess _granularPrometheusMetricsState gqlMetrics totalTime opName _qHash opType = do
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         (Just opType)
         Success
         opName
-        (Just qHash)
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
       case opType of
         G.OperationTypeQuery -> liftIO $ Prometheus.Histogram.observe (gqlExecutionTimeSecondsQuery gqlMetrics) (realToFrac totalTime)

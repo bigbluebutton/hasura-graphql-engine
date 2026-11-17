@@ -56,7 +56,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
@@ -575,7 +575,6 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
               []
               (pure ModelInfoLogOff)
             seriesCounts <$> HistogramVector.read (submTotalTime $ pmSubscriptionMetrics promMetrics)
-          streamingLabel = SubscriptionLabel streamingSubscriptionLabel
 
       subscriberA <- runIO $ addSubscriber "a" (RequestId "request-id-a") (queryPlanFor cohortIdA (mkCohortKey "10"))
       subscriberB <- runIO $ addSubscriber "b" (RequestId "request-id-b") (queryPlanFor cohortIdB (mkCohortKey "20"))
@@ -584,12 +583,13 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
       plainObservations <- runIO $ pollOnce GranularMetricsOff
       runIO $ removeSubscriber subscriberB
 
-      it "with granular metrics, the poll is still recorded under the remaining subscriber's operation name" $ do
-        granularObservations
-          `shouldBe` labeledCounts [(streamingLabel (Just (DynamicGraphqlOperationLabel (Just paramQueryHash) operationName)), 1)]
+      -- The poll time histograms are by subscription kind only, so a poll is one observation
+      -- whatever the granularity setting.
+      it "with granular metrics, the poll is recorded once, by subscription kind" $ do
+        granularObservations `shouldBe` labeledCounts [(streamingSubscriptionLabel, 1)]
 
-      it "without granular metrics, the poll is recorded once" $ do
-        plainObservations `shouldBe` labeledCounts [(streamingLabel Nothing, 1)]
+      it "without granular metrics, the poll is recorded once, by subscription kind" $ do
+        plainObservations `shouldBe` labeledCounts [(streamingSubscriptionLabel, 1)]
 
     describe "A subscriber added during a poll in which its cohort's key advances" $ do
       -- The poll runs here, while the spec is built and the "numbers" table still exists, so
@@ -643,7 +643,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
               _ -> error "expected a single cohort"
           operationNameCount poller = STM.atomically $ TMap.lookup operationName (_pOperationNamesMap poller)
           activeSubscriptions =
-            Map.lookup (SubscriptionLabel streamingSubscriptionLabel Nothing)
+            Map.lookup (SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel "NumbersStream"))))
               <$> GaugeVector.read (submActiveSubscriptions $ pmSubscriptionMetrics promMetrics)
 
       subscriberA <- runIO $ addSubscriber "a" (RequestId "request-id-a") (queryPlanFor cohortIdA cohortKey1)

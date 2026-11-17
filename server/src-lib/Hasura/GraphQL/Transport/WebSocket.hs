@@ -1,7 +1,8 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- guards subscription pushes with a per-operation liveness flag instead of an opMap lookup,
 -- so the first live query result is not dropped when the poller runs before the operation
--- is registered (https://github.com/hasura/graphql-engine/issues/10952). See BBB-CHANGES.md.
+-- is registered (https://github.com/hasura/graphql-engine/issues/10952); labels the GraphQL
+-- request counter by operation name, always, without the query hash. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | This file contains the handlers that are used within websocket server.
@@ -753,11 +754,10 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
           liftIO $ startStreamingQuery rootFieldName streamQueryBuilder parameterizedQueryHash requestId granularPrometheusMetricsState modifier modelInfoLogStatus''
 
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         (Just G.OperationTypeSubscription)
         Success
         opName
-        (Just parameterizedQueryHash)
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
       liftIO $ logOpEv ODStarted (Just requestId) (Just parameterizedQueryHash)
   where
@@ -1210,24 +1210,22 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
     catchAndIgnore m = void $ runExceptT m
 
     reportGQLQueryError :: IO GranularPrometheusMetricsState -> Maybe OperationName -> Maybe ParameterizedQueryHash -> Maybe G.OperationType -> IO ()
-    reportGQLQueryError granularPrometheusMetricsState mOpName mQHash mOpType =
+    reportGQLQueryError _granularPrometheusMetricsState mOpName _mQHash mOpType =
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         mOpType
         Failed
         mOpName
-        mQHash
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
 
     -- Tally and record execution times for successful GraphQL requests.
     recordGQLQuerySuccess :: IO GranularPrometheusMetricsState -> DiffTime -> Maybe OperationName -> ParameterizedQueryHash -> G.OperationType -> IO ()
-    recordGQLQuerySuccess granularPrometheusMetricsState totalTime mOpName qHash opType = do
+    recordGQLQuerySuccess _granularPrometheusMetricsState totalTime mOpName _qHash opType = do
       recordGraphqlOperationMetric
-        granularPrometheusMetricsState
+        prometheusMetrics
         (Just opType)
         Success
         mOpName
-        (Just qHash)
         (Prometheus.CounterVector.inc $ gqlRequests gqlMetrics)
       case opType of
         G.OperationTypeQuery -> liftIO $ Prometheus.Histogram.observe (gqlExecutionTimeSecondsQuery gqlMetrics) (realToFrac totalTime)

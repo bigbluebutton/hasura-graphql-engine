@@ -15,32 +15,28 @@ module Hasura.Server.PrometheusSpec (spec) where
 
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Lazy qualified as BL
-import Data.HashMap.Strict qualified as HashMap
-import Data.Int (Int64)
-import Data.Map.Strict qualified as Map
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Database.PG.Query qualified as PG
-import Hasura.GraphQL.ParameterizedQueryHash (mkUnsafeParameterizedQueryHash)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Common (defaultSource)
 import Hasura.Server.Prometheus
-import Hasura.Server.Types (GranularPrometheusMetricsState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import System.Metrics.Prometheus qualified as Prometheus
 import System.Metrics.Prometheus.CounterVector qualified as CounterVector
 import System.Metrics.Prometheus.Export qualified as PromExport
 import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
-import System.Metrics.Prometheus.Histogram (HistogramSample (..))
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
 import Test.Hspec
 
 spec :: Spec
 spec = do
   makePrometheusMetricsSpec
-  recordSubscriptionMetricSpec
+  operationNameLabelSpec
+  operationNameSeriesSpec
   pollAndPoolTimeBucketsSpec
   messagesDroppedHelpSpec
   dbExecutionTimeHelpSpec
@@ -177,41 +173,75 @@ pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time 
       ]
       \family -> (family, upperBoundsOf family) `shouldBe` (family, expected)
 
--- | A subscription poll serving several operation names is observed once per
--- name with granular metrics (each observation carries its name) and once
--- without them.
-recordSubscriptionMetricSpec :: Spec
-recordSubscriptionMetricSpec = describe "recordSubscriptionMetric" $ do
-  let operationNames =
-        HashMap.fromList
-          [ (Just (OperationName [G.name|first|]), 1),
-            (Just (OperationName [G.name|second|]), 2)
-          ]
-      queryHash = mkUnsafeParameterizedQueryHash "hash"
-      labelFor operationName = SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (Just queryHash) operationName))
-      observationsOnePoll metricsState = do
-        histogram <- HistogramVector.new []
-        recordSubscriptionMetric (pure metricsState) True operationNames queryHash streamingSubscriptionLabel \label ->
-          HistogramVector.observe histogram label 0.5
-        countsByLabels <$> HistogramVector.read histogram
-  it "observes a poll once without granular metrics" $ do
-    observationsOnePoll GranularMetricsOff
-      `shouldReturn` expectedCounts [(SubscriptionLabel streamingSubscriptionLabel Nothing, 1)]
-  it "observes a poll once per operation name with granular metrics" $ do
-    observationsOnePoll GranularMetricsOn
-      `shouldReturn` expectedCounts
-        [ (labelFor (Just (OperationName [G.name|first|])), 1),
-          (labelFor (Just (OperationName [G.name|second|])), 1)
-        ]
+-- | Every operation name label passes through 'operationNameLabel': the name for the first
+-- 'defaultOperationNameLimit' distinct names of up to 'maxOperationNameLabelLength' characters,
+-- "(other)" past them, "(unnamed)" without a name.
+operationNameLabelSpec :: Spec
+operationNameLabelSpec = describe "operationNameLabel" $ do
+  let opName = Just . OperationName . G.unsafeMkName
+  it "caps the distinct names and their length" $ do
+    defaultOperationNameLimit `shouldBe` 500
+    metrics <- makeDummyPrometheusMetrics
+    for_ [1 .. defaultOperationNameLimit] \i -> operationNameLabel metrics (opName ("op" <> tshow i))
+    operationNameLabel metrics (opName ("op" <> tshow (defaultOperationNameLimit + 1))) `shouldReturn` otherOperationLabel
+    operationNameLabel metrics (opName "op1") `shouldReturn` OperationNameLabel "op1"
+    fresh <- makeDummyPrometheusMetrics
+    let longest = T.replicate maxOperationNameLabelLength "a"
+    operationNameLabel fresh (opName longest) `shouldReturn` OperationNameLabel longest
+    operationNameLabel fresh (opName (longest <> "a")) `shouldReturn` otherOperationLabel
+    operationNameLabel metrics Nothing `shouldReturn` unnamedOperationLabel
 
--- | The observation count of each series of a histogram vector, keyed by the
--- series' label names and values (the label types have no 'Show' instance).
-countsByLabels :: (Prometheus.ToLabels l) => Map.Map l HistogramSample -> [([(Text, Text)], Int64)]
-countsByLabels = expectedCounts . map (fmap histCount) . Map.toList
+  it "admits as many distinct names as the configured limit, lower or higher than the default" $ do
+    let admitted limit count = do
+          store <- Prometheus.newStore @PrometheusMetricsSpec
+          metrics <- makePrometheusMetricsWithOperationNameLimit limit store
+          labels <- for [1 .. count] \i -> operationNameLabel metrics (opName ("op" <> tshow i))
+          pure $ length $ filter (/= otherOperationLabel) labels
+    admitted 5 10 `shouldReturn` 5
+    admitted 10000 10001 `shouldReturn` 10000
 
-expectedCounts :: (Prometheus.ToLabels l) => [(l, Int64)] -> [([(Text, Text)], Int64)]
-expectedCounts = sort . map (first (sort . HashMap.toList . Prometheus.toLabels))
+  it "admits no name for a request that failed, and labels it by name only if already admitted" $ do
+    metrics <- makeDummyPrometheusMetrics
+    let request status name = do
+          label <- newIORef Nothing
+          recordGraphqlOperationMetric metrics (Just G.OperationTypeQuery) status (opName name) (writeIORef label . fmap (\(DynamicGraphqlOperationLabel (OperationNameLabel n)) -> n) . dynamic_label)
+          readIORef label
+        other = Just (unOperationNameLabel otherOperationLabel)
+    failedFirst <- request Failed "neverSucceeded"
+    succeeded <- request Success "getUsers"
+    failedAfter <- request Failed "getUsers"
+    -- The name of the failed request was not admitted: after it, it is still only looked up.
+    stillOther <- request Failed "neverSucceeded"
+    (failedFirst, succeeded, failedAfter, stillOther)
+      `shouldBe` (other, Just "getUsers", Just "getUsers", other)
 
+-- | The subscription and request series carry operation_name whatever the granularity setting,
+-- never parameterized_query_hash, and the poll histograms carry only subscription_kind.
+operationNameSeriesSpec :: Spec
+operationNameSeriesSpec = describe "operation_name series" $ do
+  it "label every subscription and request series with the operation name, without a hash" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    let subm = pmSubscriptionMetrics metrics
+        name = Just (OperationName [G.name|getUsers|])
+    subscriptionLabel metrics streamingSubscriptionLabel name >>= GaugeVector.inc (submActiveSubscriptions subm)
+    recordGraphqlOperationMetric metrics (Just G.OperationTypeQuery) Success name (CounterVector.inc (gqlRequests (pmGraphQLRequestMetrics metrics)))
+    HistogramVector.observe (submTotalTime subm) streamingSubscriptionLabel 0.1
+    rendered <- renderSample metrics
+    let seriesOf family = [line | line <- T.lines rendered, (family <> "{") `T.isPrefixOf` line]
+    seriesOf "hasura_active_subscriptions" `shouldBe` ["hasura_active_subscriptions{operation_name=\"getUsers\",subscription_kind=\"streaming\"} 1.0"]
+    map (T.isInfixOf "operation_name=\"getUsers\"") (seriesOf "hasura_graphql_requests_total") `shouldBe` [True]
+    seriesOf "hasura_subscription_total_time_seconds_count" `shouldBe` ["hasura_subscription_total_time_seconds_count{subscription_kind=\"streaming\"} 1"]
+    filter (T.isInfixOf "parameterized_query_hash") (T.lines rendered) `shouldBe` []
+  it "label the websocket bytes sent by operation, and leave messages of no operation unlabeled" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    label <- operationNameLabel metrics (Just (OperationName [G.name|getUsers|]))
+    CounterVector.add (pmWebSocketBytesSent metrics) (Just (DynamicGraphqlOperationLabel label)) 120
+    CounterVector.add (pmWebSocketBytesSent metrics) Nothing 30
+    rendered <- renderSample metrics
+    sort [line | line <- T.lines rendered, "hasura_websocket_messages_sent_bytes_total" `T.isPrefixOf` line, not ("#" `T.isPrefixOf` line)]
+      `shouldBe` ["hasura_websocket_messages_sent_bytes_total 30.0", "hasura_websocket_messages_sent_bytes_total{operation_name=\"getUsers\"} 120.0"]
 makePrometheusMetricsSpec :: Spec
 makePrometheusMetricsSpec = describe "makePrometheusMetrics" $ do
   it "registers every metric and exports the expected # TYPE lines" $ do
@@ -252,10 +282,10 @@ observeEveryVectorOnce metrics = do
   HistogramVector.observe (eventProcessingTime etm) Nothing 0.1
   CounterVector.inc (eventProcessedTotal etm) eventStatus
   CounterVector.inc (eventInvocationTotal etm) eventStatus
-  HistogramVector.observe (submTotalTime subm) subLabel 0.1
-  HistogramVector.observe (submDBExecTotalTime subm) subLabel 0.1
+  HistogramVector.observe (submTotalTime subm) streamingSubscriptionLabel 0.1
+  HistogramVector.observe (submDBExecTotalTime subm) streamingSubscriptionLabel 0.1
   GaugeVector.inc (submActiveSubscriptions subm) subLabel
-  CounterVector.inc (pmWebSocketBytesSent metrics) (DynamicGraphqlOperationLabel Nothing Nothing)
+  CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
   GaugeVector.inc (ppmWaitingRequests pool) metadataPoolLabel

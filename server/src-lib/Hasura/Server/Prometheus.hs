@@ -1,12 +1,13 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds a metric specification and a store-backed constructor for the Prometheus
--- metrics, used by the GET /v1/metrics endpoint; observes a subscription poll once when
--- granular metrics are off; sets the buckets of the subscription poll times; says in the
--- help of the subscription database time that the pool wait is left out; describes what a
--- full websocket send queue does in the help of its counter; adds the Postgres pool
--- metrics and the pool observer that records them. See BBB-CHANGES.md.
+-- adds a metric specification and a store-backed constructor for the Prometheus metrics, used
+-- by the GET /v1/metrics endpoint; observes a subscription poll once, by subscription kind;
+-- labels operations by their capped name, always, without the query hash, up to a configurable
+-- number of names; sets the buckets of the subscription poll times; says in the help of the
+-- subscription database time that the pool wait is left out; describes what a full websocket
+-- send queue does in the help of its counter; adds the Postgres pool metrics and the pool
+-- observer that records them. See BBB-CHANGES.md.
 
 -- | Mutable references for Prometheus metrics.
 --
@@ -19,6 +20,7 @@ module Hasura.Server.Prometheus
     OpenTelemetryMetrics (..),
     PrometheusMetricsSpec,
     makePrometheusMetrics,
+    makePrometheusMetricsWithOperationNameLimit,
     makeDummyPrometheusMetrics,
     ConnectionsGauge,
     Connections (..),
@@ -44,10 +46,16 @@ module Hasura.Server.Prometheus
     SubscriptionKindLabel (..),
     SubscriptionLabel (..),
     DynamicGraphqlOperationLabel (..),
+    OperationNameLabel (..),
+    operationNameLabel,
+    subscriptionLabel,
+    unnamedOperationLabel,
+    otherOperationLabel,
+    defaultOperationNameLimit,
+    maxOperationNameLabelLength,
     streamingSubscriptionLabel,
     liveQuerySubscriptionLabel,
     recordMetricWithLabel,
-    recordSubscriptionMetric,
     GraphQLRequestsLabels (..),
     recordGraphqlOperationMetric,
     PostgresPoolMetrics (..),
@@ -61,13 +69,14 @@ where
 
 import Data.HashMap.Internal.Strict qualified as Map
 import Data.HashMap.Strict qualified as HashMap
+import Data.HashSet qualified as HashSet
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as OrdMap
+import Data.Text qualified as T
 import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
 import GHC.TypeLits (Symbol)
-import Hasura.GraphQL.ParameterizedQueryHash
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Common (SourceName, sourceNameToText)
@@ -110,7 +119,7 @@ data PrometheusMetrics = PrometheusMetrics
     pmGraphQLRequestMetrics :: GraphQLRequestMetrics,
     pmEventTriggerMetrics :: EventTriggerMetrics,
     pmWebSocketBytesReceived :: Counter,
-    pmWebSocketBytesSent :: CounterVector DynamicGraphqlOperationLabel,
+    pmWebSocketBytesSent :: CounterVector (Maybe DynamicGraphqlOperationLabel),
     pmActionBytesReceived :: Counter,
     pmActionBytesSent :: Counter,
     pmScheduledTriggerMetrics :: ScheduledTriggerMetrics,
@@ -134,6 +143,11 @@ data PrometheusMetrics = PrometheusMetrics
     pmCacheRequestMetrics :: CacheRequestMetrics,
     pmOpenTelemetryMetrics :: OpenTelemetryMetrics,
     pmPostgresPoolMetrics :: PostgresPoolMetrics,
+    -- | The operation names admitted as label values so far, and how many (see
+    -- 'operationNameLabel').
+    pmOperationNameLabels :: IORef (HashSet.HashSet Text, Int),
+    -- | How many distinct operation names 'operationNameLabel' admits as label values.
+    pmOperationNameLimit :: Int,
     -- | Sample every metric registered to the Prometheus metrics store.
     -- 'makeDummyPrometheusMetrics' returns an empty sample; the sample of
     -- 'makePrometheusMetrics' covers all the metrics above that are backed
@@ -255,8 +269,8 @@ data SubscriptionMetrics = SubscriptionMetrics
     submActiveStreamingPollers :: Gauge,
     submActiveLiveQueryPollersInError :: Gauge,
     submActiveStreamingPollersInError :: Gauge,
-    submTotalTime :: HistogramVector.HistogramVector SubscriptionLabel,
-    submDBExecTotalTime :: HistogramVector.HistogramVector SubscriptionLabel,
+    submTotalTime :: HistogramVector.HistogramVector SubscriptionKindLabel,
+    submDBExecTotalTime :: HistogramVector.HistogramVector SubscriptionKindLabel,
     submActiveSubscriptions :: GaugeVector.GaugeVector SubscriptionLabel
   }
 
@@ -299,7 +313,9 @@ makeDummyPrometheusMetrics = do
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
   pmPostgresPoolMetrics <- makeDummyPostgresPoolMetrics
-  let pmSample = pure mempty
+  pmOperationNameLabels <- newIORef (mempty, 0)
+  let pmOperationNameLimit = defaultOperationNameLimit
+      pmSample = pure mempty
   pure PrometheusMetrics {..}
 
 makeDummyPostgresPoolMetrics :: IO PostgresPoolMetrics
@@ -500,17 +516,85 @@ streamingSubscriptionLabel = SubscriptionKindLabel "streaming"
 liveQuerySubscriptionLabel :: SubscriptionKindLabel
 liveQuerySubscriptionLabel = SubscriptionKindLabel "live-query"
 
-data DynamicGraphqlOperationLabel = DynamicGraphqlOperationLabel
-  { _dslParamQueryHash :: Maybe ParameterizedQueryHash,
-    _dslOperationName :: Maybe OperationName
+-- | The operation_name label of a metric: the operation's name as 'operationNameLabel' admits it.
+-- There is no parameterized_query_hash label: it changes with the query text, so series of one
+-- operation could not be compared across builds.
+newtype DynamicGraphqlOperationLabel = DynamicGraphqlOperationLabel
+  { _dslOperationName :: OperationNameLabel
   }
   deriving stock (Generic, Ord, Eq)
 
 instance ToLabels DynamicGraphqlOperationLabel where
-  toLabels (DynamicGraphqlOperationLabel hash opName) =
-    Map.fromList
-      $ maybe [] (\pqh -> [("parameterized_query_hash", bsToTxt $ unParamQueryHash pqh)]) hash
-      <> maybe [] (\op -> [("operation_name", G.unName $ _unOperationName op)]) opName
+  toLabels (DynamicGraphqlOperationLabel (OperationNameLabel name)) = Map.singleton "operation_name" name
+
+-- | A websocket message that belongs to no operation (an acknowledgement, a keepalive) has no
+-- operation_name label.
+instance ToLabels (Maybe DynamicGraphqlOperationLabel) where
+  toLabels = maybe mempty toLabels
+
+-- | An operation_name label value.
+newtype OperationNameLabel = OperationNameLabel {unOperationNameLabel :: Text}
+  deriving stock (Show, Generic, Ord, Eq)
+  deriving newtype (Hashable)
+
+-- | The label of a subscription's series: its kind and its operation's name.
+subscriptionLabel :: PrometheusMetrics -> SubscriptionKindLabel -> Maybe OperationName -> IO SubscriptionLabel
+subscriptionLabel prometheusMetrics kind operationName =
+  SubscriptionLabel kind . Just . DynamicGraphqlOperationLabel <$> operationNameLabel prometheusMetrics operationName
+
+-- | The label value of an operation without a name.
+unnamedOperationLabel :: OperationNameLabel
+unnamedOperationLabel = OperationNameLabel "(unnamed)"
+
+-- | The label value of a name past the cap of distinct names, or longer than 128 characters. The
+-- parentheses keep both values apart from real names, which GraphQL restricts to
+-- [_A-Za-z][_0-9A-Za-z]* (the engine only sees parsed names).
+otherOperationLabel :: OperationNameLabel
+otherOperationLabel = OperationNameLabel "(other)"
+
+-- | The operation_name label value of every metric: the name itself for the first
+-- 'pmOperationNameLimit' distinct names of up to 'maxOperationNameLabelLength' characters,
+-- 'otherOperationLabel' for any other, and 'unnamedOperationLabel' for an operation without a
+-- name. The names come from the clients, so without the cap any client could create new series
+-- at will.
+operationNameLabel :: PrometheusMetrics -> Maybe OperationName -> IO OperationNameLabel
+operationNameLabel PrometheusMetrics {pmOperationNameLabels, pmOperationNameLimit} = \case
+  Nothing -> pure unnamedOperationLabel
+  Just (OperationName name)
+    | T.length text > maxOperationNameLabelLength -> pure otherOperationLabel
+    | otherwise -> do
+        (admitted, _) <- readIORef pmOperationNameLabels
+        if HashSet.member text admitted
+          then pure (OperationNameLabel text)
+          else atomicModifyIORef' pmOperationNameLabels \(names, count) ->
+            -- The count is kept alongside, as the size of a set is linear in it.
+            if HashSet.member text names
+              then ((names, count), OperationNameLabel text)
+              else
+                if count >= pmOperationNameLimit
+                  then ((names, count), otherOperationLabel)
+                  else ((HashSet.insert text names, count + 1), OperationNameLabel text)
+    where
+      text = G.unName name
+
+-- | How many distinct operation names 'operationNameLabel' admits as label values by default
+-- (HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT sets it).
+defaultOperationNameLimit :: Int
+defaultOperationNameLimit = 500
+
+-- | The longest operation name, in characters, that 'operationNameLabel' admits as a label value.
+maxOperationNameLabelLength :: Int
+maxOperationNameLabelLength = 128
+
+-- | The label of a name already admitted by 'operationNameLabel', and 'otherOperationLabel' for any
+-- other name: it only looks the name up, so the name takes no place.
+admittedOperationNameLabel :: PrometheusMetrics -> Maybe OperationName -> IO OperationNameLabel
+admittedOperationNameLabel PrometheusMetrics {pmOperationNameLabels} = \case
+  Nothing -> pure unnamedOperationLabel
+  Just (OperationName name) -> do
+    (admitted, _) <- readIORef pmOperationNameLabels
+    let text = G.unName name
+    pure if HashSet.member text admitted then OperationNameLabel text else otherOperationLabel
 
 data SubscriptionLabel = SubscriptionLabel
   { _slKind :: SubscriptionKindLabel,
@@ -583,60 +667,21 @@ observeHistogramWithLabel getMetricState alwaysObserve histogramVector label val
     (liftIO $ HistogramVector.observe histogramVector (Just label) value)
     (liftIO $ HistogramVector.observe histogramVector Nothing value)
 
--- | Record a subscription metric for all the operation names present in the subscription.
--- Use this when you want to update the same value of the metric for all the operation names.
-recordSubscriptionMetric ::
-  (MonadIO m) =>
-  (IO GranularPrometheusMetricsState) ->
-  -- should the metric be observed without a label when granularMetricsState is OFF
-  Bool ->
-  HashMap (Maybe OperationName) Int ->
-  ParameterizedQueryHash ->
-  SubscriptionKindLabel ->
-  -- the mertic action to perform
-  (SubscriptionLabel -> IO ()) ->
-  m ()
-recordSubscriptionMetric getMetricState alwaysObserve operationNamesMap parameterizedQueryHash subscriptionKind metricAction = do
-  -- if no operation names are present, then emit metric with only param query hash as dynamic label
-  if (null operationNamesMap)
-    then do
-      let promMetricGranularLabel = SubscriptionLabel subscriptionKind (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) Nothing)
-          promMetricLabel = SubscriptionLabel subscriptionKind Nothing
-      recordMetricWithLabel
-        getMetricState
-        alwaysObserve
-        (metricAction promMetricGranularLabel)
-        (metricAction promMetricLabel)
-    else -- if operationNames are present, then emit the same metric for all the operation names
-      do
-        -- without granular metrics the value is observed once, as it comes from a single poll
-        let operationNames = HashMap.keys operationNamesMap
-            promMetricGranularLabel opName = SubscriptionLabel subscriptionKind (Just $ DynamicGraphqlOperationLabel (Just parameterizedQueryHash) opName)
-            promMetricLabel = SubscriptionLabel subscriptionKind Nothing
-        recordMetricWithLabel
-          getMetricState
-          alwaysObserve
-          (for_ operationNames (metricAction . promMetricGranularLabel))
-          (metricAction promMetricLabel)
-
+-- | Record a GraphQL request metric, always labeled with the operation's name.
 recordGraphqlOperationMetric ::
   (MonadIO m) =>
-  (IO GranularPrometheusMetricsState) ->
+  PrometheusMetrics ->
   Maybe G.OperationType ->
   ResponseStatus ->
   Maybe OperationName ->
-  Maybe ParameterizedQueryHash ->
   (GraphQLRequestsLabels -> IO ()) ->
   m ()
-recordGraphqlOperationMetric getMetricState operationType responseStatus operationName parameterizedQueryHash metricAction = do
-  let dynamicLabel = DynamicGraphqlOperationLabel parameterizedQueryHash operationName
-      promMetricGranularLabel = GraphQLRequestsLabels operationType responseStatus (Just dynamicLabel)
-      promMetricLabel = GraphQLRequestsLabels operationType responseStatus Nothing
-  recordMetricWithLabel
-    getMetricState
-    True
-    (metricAction promMetricGranularLabel)
-    (metricAction promMetricLabel)
+recordGraphqlOperationMetric prometheusMetrics operationType responseStatus operationName metricAction = liftIO do
+  -- A request that failed (an invalid one, say) does not take a place among the names.
+  label <- case responseStatus of
+    Success -> operationNameLabel prometheusMetrics operationName
+    Failed -> admittedOperationNameLabel prometheusMetrics operationName
+  metricAction $ GraphQLRequestsLabels operationType responseStatus (Just (DynamicGraphqlOperationLabel label))
 
 --------------------------------------------------------------------------------
 -- Store-backed metrics (BigBlueButton)
@@ -803,13 +848,13 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "hasura_subscription_total_time_seconds"
       "Time taken to complete a subscription poll cycle, in seconds"
       'HistogramType
-      SubscriptionLabel
+      SubscriptionKindLabel
   SubscriptionDbExecutionTimeSeconds ::
     PrometheusMetricsSpec
       "hasura_subscription_db_execution_time_seconds"
       "Time spent executing the subscription query in the database, excluding the wait for a pool connection, in seconds"
       'HistogramType
-      SubscriptionLabel
+      SubscriptionKindLabel
   ActiveSubscriptions ::
     PrometheusMetricsSpec
       "hasura_active_subscriptions"
@@ -827,7 +872,7 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "hasura_websocket_messages_sent_bytes_total"
       "Total number of bytes sent in websocket messages"
       'CounterType
-      DynamicGraphqlOperationLabel
+      (Maybe DynamicGraphqlOperationLabel)
   ActionBytesReceivedTotal ::
     PrometheusMetricsSpec
       "hasura_action_bytes_received_total"
@@ -938,7 +983,11 @@ instance ToLabels GraphQLOperationTypeLabel where
 -- metric name/label pair is registered twice; the specification above
 -- guarantees this does not happen.
 makePrometheusMetrics :: Store PrometheusMetricsSpec -> IO PrometheusMetrics
-makePrometheusMetrics store = do
+makePrometheusMetrics = makePrometheusMetricsWithOperationNameLimit defaultOperationNameLimit
+
+-- | 'makePrometheusMetrics' with the number of distinct operation names admitted as label values.
+makePrometheusMetricsWithOperationNameLimit :: Int -> Store PrometheusMetricsSpec -> IO PrometheusMetrics
+makePrometheusMetricsWithOperationNameLimit pmOperationNameLimit store = do
   pmConnections <- newConnectionsGauge
   registerPermanently store
     $ registerGroup
@@ -964,6 +1013,7 @@ makePrometheusMetrics store = do
   pmCacheRequestMetrics <- makeDummyCacheRequestMetrics
   pmOpenTelemetryMetrics <- makeDummyOpenTelemetryMetrics
   pmPostgresPoolMetrics <- makePostgresPoolMetrics store
+  pmOperationNameLabels <- newIORef (mempty, 0)
   let pmSample = sampleAll store
   pure PrometheusMetrics {..}
 

@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- does not observe the database time of a poll batch that ran no query. See BBB-CHANGES.md.
+-- observes the poll time histograms by subscription kind only; does not observe the database
+-- time of a poll batch that ran no query. See BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -43,7 +44,7 @@ import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.SQL.Value (TxtEncodedVal (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionMetrics (..), recordSubscriptionMetric, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionMetrics (..), streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Refined (unrefine)
@@ -270,7 +271,7 @@ pollStreamingQuery ::
   [ModelInfoPart] ->
   IO ModelInfoLogState ->
   IO ()
-pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, sourceConfig) roleName parameterizedQueryHash query cohortMap rootFieldName postPollHook testActionMaybe prometheusMetrics granularPrometheusMetricsState operationNames' resolvedConnectionTemplate modifier logger modelInfoList modelInfoLogStatus = do
+pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, sourceConfig) roleName parameterizedQueryHash query cohortMap rootFieldName postPollHook testActionMaybe prometheusMetrics _granularPrometheusMetricsState operationNames' resolvedConnectionTemplate modifier logger modelInfoList modelInfoLogStatus = do
   operationNames <- STM.atomically $ TMap.getMap operationNames'
   (totalTime, (snapshotTime, (batchesDetails, processedCohorts, maybeErrors))) <- withElapsedTime $ do
     -- snapshot the current cohorts and split them into batches
@@ -298,13 +299,7 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
       let dbExecTimeMetric = submDBExecTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
       -- A batch that got no pool connection ran no query, and has no database time to observe.
       for_ maybeQueryExecutionTime \queryExecutionTime' ->
-        recordSubscriptionMetric
-          granularPrometheusMetricsState
-          True
-          operationNames
-          parameterizedQueryHash
-          streamingSubscriptionLabel
-          (flip (HistogramVector.observe dbExecTimeMetric) (realToFrac queryExecutionTime'))
+        liftIO $ HistogramVector.observe dbExecTimeMetric streamingSubscriptionLabel (realToFrac queryExecutionTime')
       let queryExecutionTime = fromMaybe 0 maybeQueryExecutionTime
 
       previousPollerResponseState <- STM.readTVarIO pollerResponseState
@@ -480,13 +475,7 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
       unLogger logger $ ModelInfoLog LevelInfo $ ModelInfo modelName (toTxt modelType) (toTxt <$> modelSourceName) (toTxt <$> modelSourceType) (toTxt modelQueryType) False
   postPollHook pollDetails
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
-  recordSubscriptionMetric
-    granularPrometheusMetricsState
-    True
-    operationNames
-    parameterizedQueryHash
-    streamingSubscriptionLabel
-    (flip (HistogramVector.observe totalTimeMetric) (realToFrac totalTime))
+  liftIO $ HistogramVector.observe totalTimeMetric streamingSubscriptionLabel (realToFrac totalTime)
   where
     SubscriptionsOptions batchSize _ = streamingQueryOpts
 

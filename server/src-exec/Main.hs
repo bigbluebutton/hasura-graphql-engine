@@ -1,6 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
 -- registers the Prometheus metrics to a metric store so that GET /v1/metrics
--- can export them. See BBB-CHANGES.md.
+-- can export them, with the configured number of operation names. See BBB-CHANGES.md.
 module Main
   ( main,
   )
@@ -36,10 +36,11 @@ import Hasura.Server.App (CEConsoleType (OSSConsole))
 import Hasura.Server.Init
 import Hasura.Server.Metrics (ServerMetricsSpec, createServerMetrics)
 import Hasura.Server.Migrate (downgradeCatalog)
-import Hasura.Server.Prometheus (PrometheusMetricsSpec, makePrometheusMetrics)
+import Hasura.Server.Prometheus (PrometheusMetricsSpec, makePrometheusMetricsWithOperationNameLimit)
 import Hasura.Server.Version
 import Hasura.ShutdownLatch
 import Hasura.Tracing (sampleAlways)
+import Refined (unrefine)
 import System.Environment (getEnvironment, lookupEnv, unsetEnv)
 import System.Exit qualified as Sys
 import System.Metrics qualified as EKG
@@ -102,7 +103,7 @@ runApp env (HGEOptions rci metadataDbUrl hgeCmd) = do
         pure (EKG.subset EKG.emptyOf store, serverMetrics)
 
       promMetricsStore <- liftIO $ Prometheus.newStore @PrometheusMetricsSpec
-      prometheusMetrics <- liftIO $ makePrometheusMetrics promMetricsStore
+      prometheusMetrics <- liftIO $ makePrometheusMetricsWithOperationNameLimit (unrefine soMetricsOperationNameLimit) promMetricsStore
 
       -- It'd be nice if we didn't have to call lowerManagedT twice here, but
       -- there is a data dependency problem since the call to runAppM below
