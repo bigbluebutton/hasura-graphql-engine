@@ -36,7 +36,7 @@ import Hasura.Backends.Postgres.Execute.Subscription (MultiplexedQuery (Multiple
 import Hasura.Backends.Postgres.Instances.Transport (withQueryExecutionTime)
 import Hasura.Backends.Postgres.SQL.Value (TxtEncodedVal (TELit))
 import Hasura.Base.Error (Code (Unexpected), QErr, err500, showQErr)
-import Hasura.GraphQL.Execute.Subscription.Options (mkSubscriptionsOptions)
+import Hasura.GraphQL.Execute.Subscription.Options (RefetchInterval (..), SubscriptionsOptions, mkSubscriptionsOptions)
 import Hasura.GraphQL.Execute.Subscription.Plan
 import Hasura.GraphQL.Execute.Subscription.Poll.Common
 import Hasura.GraphQL.Execute.Subscription.Poll.LiveQuery (pollLiveQuery)
@@ -62,6 +62,7 @@ import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogSta
 import Language.GraphQL.Draft.Syntax (unsafeMkName)
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
 import ListT qualified
+import Refined.Unsafe (unsafeRefine)
 import StmContainers.Map qualified as STMMap
 import System.Environment (getEnvironment)
 import System.Exit (exitFailure)
@@ -756,13 +757,16 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
       let -- A poller whose only polls are the ones a test runs: a sentinel subscriber, on a
           -- cursor past every row, creates it, and its thread is stopped at once.
           newOpScenario :: IO OpScenario
-          newOpScenario = do
+          newOpScenario = newOpScenarioWith (mkSubscriptionsOptions Nothing Nothing) True
+          -- The same, with the given options, and with the poller's thread left running if
+          -- not stopped.
+          newOpScenarioWith :: SubscriptionsOptions -> Bool -> IO OpScenario
+          newOpScenarioWith subOptions stopThread = do
             subscriptionState <- initSubscriptionsState (const (pure ()))
             promMetrics <- makeDummyPrometheusMetrics
             wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
             received <- newIORef ([] :: [(Text, Int)])
-            let subOptions = mkSubscriptionsOptions Nothing Nothing
-                quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+            let quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
                 plan cohortId cursor =
                   SubscriptionQueryPlan
                     (ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery multiplexedQuery)
@@ -800,7 +804,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
             sentinel <- joinNamed (Just (OperationName [G.name|Sentinel|])) "sentinel" 1000
             poller <- maybe (error "no poller") pure . listToMaybe =<< pollers
             ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
-            Immortal.stop (_pThread ioState)
+            when stopThread $ Immortal.stop (_pThread ioState)
             pollDetails <- newIORef []
             let poll duringPoll =
                   pollStreamingQuery
@@ -989,6 +993,30 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         it "the time of the polls is split among the operations, in whole microseconds" $ do
           sum (map snd totalTime) `shouldBe` fromIntegral (sum (map totalOf details))
           totalTime `shouldBe` expectedFrom totalOf
+
+      describe "time between polls" $ do
+        -- A running poller, polling every 0.2 s, for about a second.
+        (intervals, polls) <- runIO do
+          let every = RefetchInterval (unsafeRefine 0.2)
+          OpScenario {..} <- newOpScenarioWith (mkSubscriptionsOptions Nothing (Just every)) False
+          threadDelay 1100000
+          osLeave (op "Sentinel") osSentinel
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+          intervals <- Map.lookup streamingSubscriptionLabel <$> HistogramVector.read submPollInterval
+          polls <- byOperation submPollsByOperation "Sentinel"
+          osStop
+          pure (intervals, polls)
+        -- Only what does not depend on how fast the machine is: the count against the polls, and a
+        -- time between polls of at least the refetch interval.
+        let observed = maybe 0 histCount intervals
+        it "each poll after the first observes the time since the previous one started" $ do
+          -- One fewer than the polls, or as many if the poller was stopped in a poll it had
+          -- just started.
+          observed `shouldSatisfy` (`elem` [max 0 (round polls - 1), round polls])
+          observed `shouldSatisfy` (> 0)
+        it "the time between polls is at least the refetch interval" $ do
+          let mean = maybe 0 (\h -> histSum h / fromIntegral (histCount h)) intervals
+          mean `shouldSatisfy` (>= 0.2)
 
       describe "a live query poll" $ do
         -- Two subscribers of LiveOp in one cohort of a live query poller, whose thread is stopped,

@@ -324,6 +324,14 @@ always on.
     transformation argument of `createCounterVector`; the embedded `ekg-prometheus` is
     unchanged).
 
+## Subscription poll interval and start time
+
+- `hasura_subscription_poll_interval_seconds{subscription_kind}` observes, in each poller's
+  loop (`addLiveQuery` and `addStreamSubscriptionQuery` in
+  `Hasura.GraphQL.Execute.Subscription.State`), the time between the start of a poll and the
+  start of the next one: the poll itself plus the refetch interval. The first poll of a poller
+  has no previous one and is not observed. It uses the poll time buckets.
+
 ## Formatting
 
 `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and

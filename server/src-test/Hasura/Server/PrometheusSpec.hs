@@ -34,6 +34,7 @@ import System.Metrics.Prometheus qualified as Prometheus
 import System.Metrics.Prometheus.CounterVector qualified as CounterVector
 import System.Metrics.Prometheus.Export qualified as PromExport
 import System.Metrics.Prometheus.GaugeVector qualified as GaugeVector
+import System.Metrics.Prometheus.Histogram (HistogramSample (..))
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
 import Test.Hspec
 
@@ -220,7 +221,7 @@ messagesDroppedHelpSpec = describe "hasura_websocket_messages_dropped_total" $ d
 -- the two Postgres pool time histograms.
 pollAndPoolTimeBucketsSpec :: Spec
 pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time buckets" $ do
-  it "are the full list, including 150 ms and 333 ms, for all four histograms" $ do
+  it "are the full list, including 150 ms and 333 ms, for every such histogram" $ do
     store <- Prometheus.newStore @PrometheusMetricsSpec
     metrics <- makePrometheusMetrics store
     observeEveryVectorOnce metrics
@@ -237,7 +238,8 @@ pollAndPoolTimeBucketsSpec = describe "subscription poll and Postgres pool time 
       [ "hasura_subscription_total_time_seconds",
         "hasura_subscription_db_execution_time_seconds",
         "hasura_postgres_pool_wait_time_seconds",
-        "hasura_postgres_connection_init_time_seconds"
+        "hasura_postgres_connection_init_time_seconds",
+        "hasura_subscription_poll_interval_seconds"
       ]
       \family -> (family, upperBoundsOf family) `shouldBe` (family, expected)
 
@@ -306,6 +308,17 @@ operationNameSeriesSpec = describe "operation_name series" $ do
     map (T.isInfixOf "operation_name=\"getUsers\"") (seriesOf "hasura_graphql_requests_total") `shouldBe` [True]
     seriesOf "hasura_subscription_total_time_seconds_count" `shouldBe` ["hasura_subscription_total_time_seconds_count{subscription_kind=\"streaming\"} 1"]
     filter (T.isInfixOf "parameterized_query_hash") (T.lines rendered) `shouldBe` []
+  it "observe the time between two poll starts, and nothing at a poller's first poll" $ do
+    metrics <- makeDummyPrometheusMetrics
+    previousStart <- newIORef Nothing
+    let intervals = OrdMap.lookup streamingSubscriptionLabel <$> HistogramVector.read (submPollInterval (pmSubscriptionMetrics metrics))
+    observePollStart metrics streamingSubscriptionLabel previousStart
+    afterFirst <- intervals
+    observePollStart metrics streamingSubscriptionLabel previousStart
+    afterSecond <- intervals
+    fmap histCount afterFirst `shouldBe` Nothing
+    fmap histCount afterSecond `shouldBe` Just 1
+    fmap histSum afterSecond `shouldSatisfy` maybe False (>= 0)
   it "label the websocket bytes sent by operation, and leave messages of no operation unlabeled" $ do
     store <- Prometheus.newStore @PrometheusMetricsSpec
     metrics <- makePrometheusMetrics store
@@ -380,6 +393,7 @@ observeEveryVectorOnce metrics = do
   CounterVector.inc (submResultBytes subm) (SubscriptionChangedLabel subLabel True)
   CounterVector.inc (submDBExecutionMicroseconds subm) subLabel
   CounterVector.inc (submTotalTimeMicroseconds subm) subLabel
+  HistogramVector.observe (submPollInterval subm) streamingSubscriptionLabel 0.2
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -445,6 +459,7 @@ expectedTypeLines =
       "# TYPE hasura_subscription_result_bytes_total counter",
       "# TYPE hasura_subscription_db_execution_seconds_total counter",
       "# TYPE hasura_subscription_total_time_seconds_total counter",
+      "# TYPE hasura_subscription_poll_interval_seconds histogram",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

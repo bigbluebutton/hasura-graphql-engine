@@ -58,6 +58,7 @@ module Hasura.Server.Prometheus
     recordPushByOperation,
     splitBySubscribers,
     wholeMicroseconds,
+    observePollStart,
     addCohortResultBytes,
     SubscriptionChangedLabel (..),
     unnamedOperationLabel,
@@ -90,6 +91,7 @@ import Data.Text qualified as T
 import Data.Time.Clock (diffTimeToPicoseconds)
 import Data.UUID (UUID)
 import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
+import GHC.Clock (getMonotonicTime)
 import GHC.TypeLits (Symbol)
 import Hasura.GraphQL.Transport.HTTP.Protocol (OperationName (..))
 import Hasura.Prelude
@@ -311,7 +313,9 @@ data SubscriptionMetrics = SubscriptionMetrics
     -- | Database execution time and poll time, in whole microseconds, split among the operations
     -- of the poller in proportion to their subscribers. Exported in seconds.
     submDBExecutionMicroseconds :: CounterVector SubscriptionLabel,
-    submTotalTimeMicroseconds :: CounterVector SubscriptionLabel
+    submTotalTimeMicroseconds :: CounterVector SubscriptionLabel,
+    -- | Time between the starts of consecutive polls of a poller.
+    submPollInterval :: HistogramVector.HistogramVector SubscriptionKindLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -428,6 +432,7 @@ makeDummySubscriptionMetrics = do
   submResultBytes <- CounterVector.new
   submDBExecutionMicroseconds <- CounterVector.new
   submTotalTimeMicroseconds <- CounterVector.new
+  submPollInterval <- HistogramVector.new []
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -679,6 +684,14 @@ addCohortResultBytes resultBytes changed size =
     let !changedBytes' = if changed then changedBytes + fromIntegral size else changedBytes
         !unchangedBytes' = if changed then unchangedBytes else unchangedBytes + fromIntegral size
      in ((changedBytes', unchangedBytes'), ())
+
+-- | Observes the time since the previous poll of a poller started, kept in the given reference,
+-- and records this start. The first poll of a poller has no previous one and is not observed.
+observePollStart :: PrometheusMetrics -> SubscriptionKindLabel -> IORef (Maybe Double) -> IO ()
+observePollStart PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind previousStart = do
+  start <- getMonotonicTime
+  previous <- atomicModifyIORef' previousStart (Just start,)
+  for_ previous \previousTime -> HistogramVector.observe submPollInterval kind (start - previousTime)
 
 -- | A time in whole microseconds (truncated).
 wholeMicroseconds :: DiffTime -> Int64
@@ -1023,6 +1036,12 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Current number of active subscription pollers in error state"
       'GaugeType
       SubscriptionKindLabel
+  SubscriptionPollIntervalSeconds ::
+    PrometheusMetricsSpec
+      "hasura_subscription_poll_interval_seconds"
+      "Time between the starts of consecutive polls of a subscription poller, in seconds"
+      'HistogramType
+      SubscriptionKindLabel
   SubscriptionTotalTimeSeconds ::
     PrometheusMetricsSpec
       "hasura_subscription_total_time_seconds"
@@ -1340,6 +1359,7 @@ makeSubscriptionMetrics store = do
   let microsecondsToSeconds = map (fmap (/ 1000000)) . OrdMap.toList
   submDBExecutionMicroseconds <- createCounterVector SubscriptionDBExecutionSecondsTotal store microsecondsToSeconds
   submTotalTimeMicroseconds <- createCounterVector SubscriptionTotalTimeSecondsTotal store microsecondsToSeconds
+  submPollInterval <- createHistogramVector pollAndPoolTimeBuckets SubscriptionPollIntervalSeconds store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).
@@ -1356,9 +1376,10 @@ eventProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30, 100]
 eventWebhookProcessingTimeBuckets :: [Histogram.UpperBound]
 eventWebhookProcessingTimeBuckets = [0.01, 0.03, 0.1, 0.3, 1, 3, 10]
 
--- | Buckets for the subscription poll times (total and database) and for the two Postgres
--- pool times (the wait for a connection and opening a connection). They resolve the poll
--- intervals in use (150 ms for streaming, 333 ms for live queries) and the range up to 30 s.
+-- | Buckets for the subscription poll times (total and database), the time between polls and
+-- the two Postgres pool times (the wait for a connection and opening a connection). They resolve
+-- the poll intervals in use (150 ms for streaming, 333 ms for live queries) and the range up to
+-- 30 s.
 pollAndPoolTimeBuckets :: [Histogram.UpperBound]
 pollAndPoolTimeBuckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.333, 0.5, 0.75, 1, 2.5, 5, 10, 30]
 
