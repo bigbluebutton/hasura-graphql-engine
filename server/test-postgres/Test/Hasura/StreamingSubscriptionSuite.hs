@@ -57,7 +57,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionChangedLabel (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, registerPollerByOperation, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax (unsafeMkName)
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
@@ -910,6 +910,107 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           pure [joined, withSecond, oneOfFirstLeft, firstLeft, removed]
         it "an operation counts the poller once, from its first subscriber in it to its last" $ do
           steps `shouldBe` [[1, 0, 1], [1, 1, 1], [1, 1, 1], [0, 1, 1], [0, 0, 0]]
+
+      describe "subscribers served and bytes sent" $ do
+        -- First has subscribers in two cohorts and Second shares one of them; the sentinel's
+        -- result is empty and is not pushed.
+        (served, sent, received) <- runIO do
+          OpScenario {..} <- newOpScenario
+          _ <- osJoin (op "First") "a" 1
+          _ <- osJoin (op "First") "b" 2
+          _ <- osJoin (op "Second") "c" 1
+          osPoll Nothing
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              byName vector = do
+                values <- CounterVector.read vector
+                pure $ sort [(name, changed, value) | (SubscriptionChangedLabel (SubscriptionLabel _ (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) changed, value) <- Map.toList values]
+          result <- (,,) <$> byName submSubscribersServed <*> byName submSentBytes <*> osReceived
+          osStop
+          pure result
+        let receivedBy names = sum [fromIntegral bytes | (subscriber, bytes) <- received, subscriber `elem` names]
+        it "each subscriber a result is pushed to counts under its own operation" $ do
+          length received `shouldBe` 3
+          served `shouldBe` [("First", True, 2), ("Second", True, 1)]
+        it "the bytes sent are the bytes each subscriber received" $ do
+          sent `shouldBe` [("First", True, receivedBy ["a", "b"]), ("Second", True, receivedBy ["c"])]
+
+      describe "a live query poll" $ do
+        -- Two subscribers of LiveOp in one cohort of a live query poller, whose thread is stopped,
+        -- and one poll run here. They are added with other metrics than the poll, so that the
+        -- first poll of the poller's own thread, before it is stopped, is not counted.
+        (polls, cohorts, served, activeCohorts) <- runIO do
+          subscriptionState <- initSubscriptionsState (const (pure ()))
+          promMetrics <- makeDummyPrometheusMetrics
+          wsId <- WS.mkUnsafeWSId <$> UUID.nextRandom
+          cohortId <- newCohortId
+          let quietLogger :: Logger Hasura = Logger $ \_ -> pure ()
+              options = mkSubscriptionsOptions Nothing Nothing
+              liveQuery =
+                [PG.sql|
+                  SELECT "_subs"."result_id", json_build_object('numbers', (SELECT coalesce(json_agg("id" ORDER BY "id"), '[]') FROM "public"."numbers"))::text AS "result"
+                  FROM UNNEST(($1)::uuid[], ($2)::json[]) AS "_subs"("result_id", "result_vars")
+                |]
+              plan =
+                SubscriptionQueryPlan
+                  (ParameterizedSubscriptionQueryPlan (mkRoleNameE "user") $ MultiplexedQuery liveQuery)
+                  srcConfig
+                  cohortId
+                  Nothing
+                  (mkCohortVariables mempty mempty mempty mempty mempty)
+                  Nothing
+              joinLive name =
+                addLiveQuery
+                  @('Postgres 'Vanilla)
+                  quietLogger
+                  dummyServerMetrics
+                  dummyPromMetrics
+                  (mkSubscriberMetadata wsId (unsafeMkOperationId name) Nothing (RequestId name))
+                  subscriptionState
+                  (pure (options, options))
+                  SNDefault
+                  paramQueryHash
+                  (op "LiveOp")
+                  (RequestId name)
+                  plan
+                  (pure GranularMetricsOff)
+                  (const (pure ()))
+                  Nothing
+                  []
+                  (pure ModelInfoLogOff)
+          _ <- joinLive "l1"
+          _ <- joinLive "l2"
+          poller <- maybe (error "no poller") pure . listToMaybe . fmap snd =<< STM.atomically (ListT.toList (STMMap.listT (_ssLiveQueryMap subscriptionState)))
+          ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
+          Immortal.stop (_pThread ioState)
+          registerPollerByOperation promMetrics (unPollerId (_pId ioState))
+          pollLiveQuery
+            @('Postgres 'Vanilla)
+            (_pId ioState)
+            (_pPollerState poller)
+            options
+            (SNDefault, srcConfig)
+            (mkRoleNameE "user")
+            paramQueryHash
+            (MultiplexedQuery liveQuery)
+            (_pCohorts poller)
+            (const $ pure ())
+            promMetrics
+            (pure GranularMetricsOff)
+            (_pOperationNamesMap poller)
+            Nothing
+            Nothing
+            quietLogger
+            []
+            (pure ModelInfoLogOff)
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics promMetrics
+              liveOp = SubscriptionLabel liveQuerySubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel "LiveOp")))
+          (,,,)
+            <$> (Map.findWithDefault 0 liveOp <$> CounterVector.read submPollsByOperation)
+            <*> (Map.findWithDefault 0 liveOp <$> CounterVector.read submCohortsProcessedByOperation)
+            <*> (Map.findWithDefault 0 (SubscriptionChangedLabel liveOp True) <$> CounterVector.read submSubscribersServed)
+            <*> (Map.findWithDefault 0 liveOp <$> GaugeVector.read submActiveCohortsByOperation)
+        it "records the poll, its cohort and the subscribers it served under the live query kind" $ do
+          (polls, cohorts, served, activeCohorts) `shouldBe` (1, 1, 2, 1)
 
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId

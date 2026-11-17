@@ -55,6 +55,8 @@ module Hasura.Server.Prometheus
     recordPollByOperation,
     forgetPollerByOperation,
     registerPollerByOperation,
+    recordPushByOperation,
+    SubscriptionChangedLabel (..),
     unnamedOperationLabel,
     otherOperationLabel,
     defaultOperationNameLimit,
@@ -294,7 +296,11 @@ data SubscriptionMetrics = SubscriptionMetrics
     submReportedCohorts :: IORef (HashMap UUID (OrdMap.Map SubscriptionLabel Int)),
     -- | Pollers serving an operation: +1 when the operation's first subscriber enters a poller,
     -- -1 when its last one leaves.
-    submActivePollersByOperation :: GaugeVector.GaugeVector SubscriptionLabel
+    submActivePollersByOperation :: GaugeVector.GaugeVector SubscriptionLabel,
+    -- | Results pushed to subscribers, by each subscriber's operation.
+    submSubscribersServed :: CounterVector SubscriptionChangedLabel,
+    -- | Bytes of the results pushed to subscribers, by each subscriber's operation.
+    submSentBytes :: CounterVector SubscriptionChangedLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -406,6 +412,8 @@ makeDummySubscriptionMetrics = do
   submActiveCohortsByOperation <- GaugeVector.new
   submReportedCohorts <- newIORef mempty
   submActivePollersByOperation <- GaugeVector.new
+  submSubscribersServed <- CounterVector.new
+  submSentBytes <- CounterVector.new
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -577,6 +585,17 @@ pollOperationLabels :: PrometheusMetrics -> HashMap (Maybe OperationName) Int ->
 pollOperationLabels prometheusMetrics names =
   HashMap.fromListWith (+) <$> for (HashMap.toList names) \(name, subscribers) -> (,subscribers) <$> operationNameLabel prometheusMetrics name
 
+-- | A cohort's result pushed to subscribers: each subscriber counts under its own operation,
+-- with the bytes of the result's payload.
+recordPushByOperation :: PrometheusMetrics -> SubscriptionKindLabel -> Bool -> Int -> [Maybe OperationName] -> IO ()
+recordPushByOperation prometheusMetrics@PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMetrics {..}} kind changed bytes operationNames =
+  unless (null operationNames) do
+    byOperation <- pollOperationLabels prometheusMetrics (HashMap.fromListWith (+) [(name, 1) | name <- operationNames])
+    for_ (HashMap.toList byOperation) \(operation, subscribers) -> do
+      let label = SubscriptionChangedLabel (SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation))) changed
+      CounterVector.add submSubscribersServed label (fromIntegral subscribers)
+      CounterVector.add submSentBytes label (fromIntegral (subscribers * bytes))
+
 -- | What a poll did, for the per-operation metrics.
 data PollByOperation = PollByOperation
   { -- | the poller's id
@@ -696,6 +715,17 @@ data SubscriptionLabel = SubscriptionLabel
 instance ToLabels SubscriptionLabel where
   toLabels (SubscriptionLabel kind Nothing) = Map.fromList $ [("subscription_kind", subscription_kind kind)]
   toLabels (SubscriptionLabel kind (Just dl)) = (Map.fromList $ [("subscription_kind", subscription_kind kind)]) <> toLabels dl
+
+-- | A per-operation label, with whether the cohort's result changed since the previous poll.
+data SubscriptionChangedLabel = SubscriptionChangedLabel
+  { _sclSubscription :: SubscriptionLabel,
+    _sclChanged :: Bool
+  }
+  deriving stock (Generic, Ord, Eq)
+
+instance ToLabels SubscriptionChangedLabel where
+  toLabels (SubscriptionChangedLabel subscription changed) =
+    toLabels subscription <> Map.singleton "changed" (if changed then "true" else "false")
 
 -- TODO: Make this a method of a new typeclass of the metrics library
 opTypeToLabelValue :: Maybe G.OperationType -> Text
@@ -970,6 +1000,18 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Current number of active cohorts of the pollers serving an operation"
       'GaugeType
       SubscriptionLabel
+  SubscriptionSubscribersServedTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_subscribers_served_total"
+      "Total number of subscription results pushed to subscribers"
+      'CounterType
+      SubscriptionChangedLabel
+  SubscriptionSentBytesTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_sent_bytes_total"
+      "Total number of bytes of subscription results pushed to subscribers"
+      'CounterType
+      SubscriptionChangedLabel
   ActiveSubscriptionPollersByOperation ::
     PrometheusMetricsSpec
       "hasura_active_subscription_pollers_by_operation"
@@ -1214,6 +1256,8 @@ makeSubscriptionMetrics store = do
   submActiveCohortsByOperation <- createGaugeVector ActiveSubscriptionCohortsByOperation store OrdMap.toList
   submReportedCohorts <- newIORef mempty
   submActivePollersByOperation <- createGaugeVector ActiveSubscriptionPollersByOperation store OrdMap.toList
+  submSubscribersServed <- createCounterVector SubscriptionSubscribersServedTotal store OrdMap.toList
+  submSentBytes <- createCounterVector SubscriptionSentBytesTotal store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

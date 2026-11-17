@@ -297,6 +297,18 @@ always on.
     transaction, and an operation's -1 always follows its +1: a subscription can only be
     removed once `addLiveQuery` or `addStreamSubscriptionQuery`, which applies the +1, has
     returned.
+  - `hasura_subscription_subscribers_served_total` and `hasura_subscription_sent_bytes_total`
+    are exact per subscriber: each subscriber a cohort's result is pushed to counts once under
+    its own operation, with the bytes of the result's payload (the database result handed to
+    the subscriber, before the websocket message wraps it, so they differ from
+    `hasura_websocket_messages_sent_bytes_total`, which counts every websocket frame).
+    `changed="true"` when the result differs from the cohort's previous one (or is an error,
+    counted with 0 bytes) and goes to all its subscribers; `changed="false"` when it is the same
+    and goes only to the subscribers that joined since the previous poll. An empty streaming
+    result is pushed to no one and counts nothing. Both count what is handed to the subscriber's
+    callback, so they can exceed what the client receives when the websocket transport drops the
+    message: an operation already stopped (`onChange`, `Hasura.GraphQL.Transport.WebSocket`), as
+    after a resend on a reconnection, or a full send queue.
 
 ## Formatting
 
@@ -403,7 +415,9 @@ Every file below carries a modification notice at the top, as required by Apache
   `server/src-lib/Hasura/GraphQL/Execute/Subscription/Poll/StreamingQuery.hs`,
   `server/src-lib/Hasura/GraphQL/Transport/HTTP.hs`, `server/src-lib/Hasura/GraphQL/Transport/WebSocket.hs` and
   `server/src-lib/Hasura/GraphQL/Transport/WebSocket/Server.hs`: the per-operation subscription metrics (see
-  "Per-operation subscription metrics" above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs` and
-  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`.
+  "Per-operation subscription metrics" above), tested in `server/src-test/Hasura/Server/PrometheusSpec.hs`,
+  `server/src-test/Hasura/GraphQL/Execute/Subscription/Poll/LiveQuerySpec.hs` (new file) and
+  `server/test-postgres/Test/Hasura/StreamingSubscriptionSuite.hs`; `LiveQuery` exports
+  `pushResultToCohort` for its test, and `server/graphql-engine.cabal` registers the test module.
 - `.github/workflows/hlint.yml` and `.github/workflows/lint.yml` (removed): upstream CI
   workflows that are not applicable to this fork.

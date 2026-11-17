@@ -1,6 +1,7 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- observes the poll time histograms by subscription kind only; does not observe the database
--- time of a poll batch that ran no query. See BBB-CHANGES.md.
+-- observes the poll time histograms by subscription kind only and records the per-operation
+-- subscription metrics; does not observe the database time of a poll batch that ran no query.
+-- See BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -44,7 +45,7 @@ import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.SQL.Value (TxtEncodedVal (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), pollOperationLabels, recordPollByOperation, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), pollOperationLabels, recordPollByOperation, recordPushByOperation, streamingSubscriptionLabel)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Refined (unrefine)
@@ -180,6 +181,7 @@ mergeOldAndNewCursorValues (CursorVariableValues prevPollCursorValues) (CursorVa
    in CursorVariableValues $ HashMap.unionWith combineFn prevPollCursorValues currentPollCursorValues
 
 pushResultToCohort ::
+  PrometheusMetrics ->
   GQResult BS.ByteString ->
   Maybe ResponseHash ->
   SubscriptionMetadata ->
@@ -195,12 +197,13 @@ pushResultToCohort ::
   -- have this data (this information is exposed by metrics reporting)
   (CohortSnapshot 'Streaming, Cohort 'Streaming) ->
   IO ([SubscriberExecutionDetails], [SubscriberExecutionDetails])
-pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cursorValues prevCursorValues rootFieldName (cohortSnapshot, cohort) = do
+pushResultToCohort prometheusMetrics result !respHashM (SubscriptionMetadata dTime) cursorValues prevCursorValues rootFieldName (cohortSnapshot, cohort) = do
   prevRespHashM <- STM.readTVarIO respRef
+  let changed = isExecError result || respHashM /= prevRespHashM
   -- write to the current websockets if needed
   (subscribersToPush, subscribersToIgnore) <-
     -- We send the response to all the subscribers only when the response changes.
-    if isExecError result || respHashM /= prevRespHashM
+    if changed
       then do
         $assertNFHere respHashM -- so we don't write thunks to mutable vars
         STM.atomically $ do
@@ -210,6 +213,9 @@ pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cursorValues p
       else -- when the response is unchanged, the response is only sent to the newly added subscribers
         return (newSinks, curSinks)
   pushResultToSubscribers subscribersToPush
+  -- An empty response is not pushed, so it serves no one.
+  unless isResponseEmpty
+    $ recordPushByOperation prometheusMetrics streamingSubscriptionLabel changed (either (const 0) BS.length result) (map _sOperationName subscribersToPush)
   pure
     $ over
       (each . each)
@@ -338,7 +344,7 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
                   Just currentPollCursorValue -> mergeOldAndNewCursorValues prevCursorVariableValue currentPollCursorValue
           (pushedSubscribers, ignoredSubscribers) <-
             -- Push the result to the subscribers present in the cohorts
-            pushResultToCohort res (fst <$> respData) subscriptionMeta latestCursorValue prevCursorVariableValue rootFieldName (snapshot, cohort)
+            pushResultToCohort prometheusMetrics res (fst <$> respData) subscriptionMeta latestCursorValue prevCursorVariableValue rootFieldName (snapshot, cohort)
           let currentCohortKey = C._csVariables snapshot
               updatedCohortKey = modifyCursorCohortVariables (mkUnsafeValidateVariables updatedCursorVarVal) $ C._csVariables snapshot
               snapshottedNewSubs = C._csNewSubscribers snapshot

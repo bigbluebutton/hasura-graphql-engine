@@ -1,12 +1,14 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- observes the poll time histograms by subscription kind only; does not observe the database
--- time of a poll batch that ran no query. See BBB-CHANGES.md.
+-- observes the poll time histograms by subscription kind only and records the per-operation
+-- subscription metrics; does not observe the database time of a poll batch that ran no query.
+-- See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 -- | Multiplexed subscription poller threads; see "Hasura.GraphQL.Execute.Subscription" for details.
 module Hasura.GraphQL.Execute.Subscription.Poll.LiveQuery
   ( -- * Pollers
     pollLiveQuery,
+    pushResultToCohort,
   )
 where
 
@@ -42,13 +44,14 @@ import Hasura.RQL.Types.BackendType (BackendType (..), PostgresKind (Vanilla))
 import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation, recordPushByOperation)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Refined (unrefine)
 import System.Metrics.Prometheus.Gauge qualified as Prometheus.Gauge
 import System.Metrics.Prometheus.HistogramVector qualified as HistogramVector
 
 pushResultToCohort ::
+  PrometheusMetrics ->
   GQResult BS.ByteString ->
   Maybe ResponseHash ->
   SubscriptionMetadata ->
@@ -56,11 +59,12 @@ pushResultToCohort ::
   -- | subscribers to which data has been pushed, subscribers which already
   -- have this data (this information is exposed by metrics reporting)
   IO ([SubscriberExecutionDetails], [SubscriberExecutionDetails])
-pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cohortSnapshot = do
+pushResultToCohort prometheusMetrics result !respHashM (SubscriptionMetadata dTime) cohortSnapshot = do
   prevRespHashM <- STM.readTVarIO respRef
+  let changed = isExecError result || respHashM /= prevRespHashM
   -- write to the current websockets if needed
   (subscribersToPush, subscribersToIgnore) <-
-    if isExecError result || respHashM /= prevRespHashM
+    if changed
       then do
         $assertNFHere respHashM -- so we don't write thunks to mutable vars
         STM.atomically $ do
@@ -68,6 +72,7 @@ pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cohortSnapshot
         return (newSinks <> curSinks, mempty)
       else return (newSinks, curSinks)
   pushResultToSubscribers subscribersToPush
+  recordPushByOperation prometheusMetrics liveQuerySubscriptionLabel changed (either (const 0) BS.length result) (map _sOperationName subscribersToPush)
   pure
     $ over
       (each . each)
@@ -159,7 +164,7 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
         $ A.forConcurrently operations
         $ \(res, cohortId, respData, snapshot) -> do
           (pushedSubscribers, ignoredSubscribers) <-
-            pushResultToCohort res (fst <$> respData) lqMeta snapshot
+            pushResultToCohort prometheusMetrics res (fst <$> respData) lqMeta snapshot
           pure
             CohortExecutionDetails
               { _cedCohortId = cohortId,
