@@ -330,6 +330,7 @@ observeEveryVectorOnce metrics = do
   CounterVector.inc (submPollErrorsByOperation subm) subLabel
   CounterVector.inc (submCohortsProcessedByOperation subm) subLabel
   GaugeVector.inc (submActiveCohortsByOperation subm) subLabel
+  GaugeVector.inc (submActivePollersByOperation subm) subLabel
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -389,6 +390,7 @@ expectedTypeLines =
       "# TYPE hasura_subscription_poll_errors_total counter",
       "# TYPE hasura_subscription_cohorts_processed_total counter",
       "# TYPE hasura_active_subscription_cohorts_by_operation gauge",
+      "# TYPE hasura_active_subscription_pollers_by_operation gauge",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

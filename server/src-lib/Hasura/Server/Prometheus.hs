@@ -291,7 +291,10 @@ data SubscriptionMetrics = SubscriptionMetrics
     -- | What each poller last added to 'submActiveCohortsByOperation', by poller id, so that a
     -- poll applies only the difference and a removed poller takes its share out. A poller is in
     -- it from its creation to its removal.
-    submReportedCohorts :: IORef (HashMap UUID (OrdMap.Map SubscriptionLabel Int))
+    submReportedCohorts :: IORef (HashMap UUID (OrdMap.Map SubscriptionLabel Int)),
+    -- | Pollers serving an operation: +1 when the operation's first subscriber enters a poller,
+    -- -1 when its last one leaves.
+    submActivePollersByOperation :: GaugeVector.GaugeVector SubscriptionLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -402,6 +405,7 @@ makeDummySubscriptionMetrics = do
   submCohortsProcessedByOperation <- CounterVector.new
   submActiveCohortsByOperation <- GaugeVector.new
   submReportedCohorts <- newIORef mempty
+  submActivePollersByOperation <- GaugeVector.new
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -966,6 +970,12 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Current number of active cohorts of the pollers serving an operation"
       'GaugeType
       SubscriptionLabel
+  ActiveSubscriptionPollersByOperation ::
+    PrometheusMetricsSpec
+      "hasura_active_subscription_pollers_by_operation"
+      "Current number of active subscription pollers serving an operation"
+      'GaugeType
+      SubscriptionLabel
   ActiveSubscriptions ::
     PrometheusMetricsSpec
       "hasura_active_subscriptions"
@@ -1203,6 +1213,7 @@ makeSubscriptionMetrics store = do
   submCohortsProcessedByOperation <- createCounterVector SubscriptionCohortsProcessedTotal store OrdMap.toList
   submActiveCohortsByOperation <- createGaugeVector ActiveSubscriptionCohortsByOperation store OrdMap.toList
   submReportedCohorts <- newIORef mempty
+  submActivePollersByOperation <- createGaugeVector ActiveSubscriptionPollersByOperation store OrdMap.toList
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

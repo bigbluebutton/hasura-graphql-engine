@@ -887,6 +887,30 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
         it "removing the poller takes its cohorts out of the gauge" $ do
           afterRemoval `shouldBe` ([5, 3, 5], [0, 0, 0])
 
+      describe "pollers serving an operation" $ do
+        -- First and Second share the poller with the sentinel.
+        steps <- runIO do
+          OpScenario {..} <- newOpScenario
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              gaugeOf name = Map.findWithDefault 0 (SubscriptionLabel streamingSubscriptionLabel (Just (DynamicGraphqlOperationLabel (OperationNameLabel name)))) <$> GaugeVector.read submActivePollersByOperation
+              snapshot = traverse gaugeOf ["First", "Second", "Sentinel"]
+          a <- osJoin (op "First") "a" 1
+          b <- osJoin (op "First") "b" 2
+          joined <- snapshot
+          c <- osJoin (op "Second") "c" 1
+          withSecond <- snapshot
+          osLeave (op "First") a
+          oneOfFirstLeft <- snapshot
+          osLeave (op "First") b
+          firstLeft <- snapshot
+          osLeave (op "Second") c
+          osLeave (op "Sentinel") osSentinel
+          removed <- snapshot
+          osStop
+          pure [joined, withSecond, oneOfFirstLeft, firstLeft, removed]
+        it "an operation counts the poller once, from its first subscriber in it to its last" $ do
+          steps `shouldBe` [[1, 0, 1], [1, 1, 1], [1, 1, 1], [0, 1, 1], [0, 0, 0]]
+
     describe "Database execution time of a subscription query while the pool is exhausted" $ do
       cohortId <- runIO newCohortId
       let -- Holds one of the pool's connections for 1.5 s.
