@@ -57,6 +57,7 @@ module Hasura.Server.Prometheus
     registerPollerByOperation,
     recordPushByOperation,
     splitBySubscribers,
+    wholeMicroseconds,
     addCohortResultBytes,
     SubscriptionChangedLabel (..),
     unnamedOperationLabel,
@@ -86,6 +87,7 @@ import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as OrdMap
 import Data.Text qualified as T
+import Data.Time.Clock (diffTimeToPicoseconds)
 import Data.UUID (UUID)
 import Database.PG.Query.Pool (PGConnectionCloseReason (..), PGPoolObserver (..))
 import GHC.TypeLits (Symbol)
@@ -305,7 +307,11 @@ data SubscriptionMetrics = SubscriptionMetrics
     submSentBytes :: CounterVector SubscriptionChangedLabel,
     -- | Bytes of the cohorts' results returned by the database, split among the operations of
     -- the poller in proportion to their subscribers.
-    submResultBytes :: CounterVector SubscriptionChangedLabel
+    submResultBytes :: CounterVector SubscriptionChangedLabel,
+    -- | Database execution time and poll time, in whole microseconds, split among the operations
+    -- of the poller in proportion to their subscribers. Exported in seconds.
+    submDBExecutionMicroseconds :: CounterVector SubscriptionLabel,
+    submTotalTimeMicroseconds :: CounterVector SubscriptionLabel
   }
 
 data CacheRequestMetrics = CacheRequestMetrics
@@ -420,6 +426,8 @@ makeDummySubscriptionMetrics = do
   submSubscribersServed <- CounterVector.new
   submSentBytes <- CounterVector.new
   submResultBytes <- CounterVector.new
+  submDBExecutionMicroseconds <- CounterVector.new
+  submTotalTimeMicroseconds <- CounterVector.new
   pure SubscriptionMetrics {..}
 
 makeDummyCacheRequestMetrics :: IO CacheRequestMetrics
@@ -613,7 +621,11 @@ data PollByOperation = PollByOperation
     -- | bytes of the cohorts' results returned by the database, of the cohorts whose result
     -- changed and of those whose result did not
     pboChangedResultBytes :: Int64,
-    pboUnchangedResultBytes :: Int64
+    pboUnchangedResultBytes :: Int64,
+    -- | the database execution time of the poll's batches, added up, and the poll's time, in
+    -- whole microseconds
+    pboDBExecutionMicroseconds :: Int64,
+    pboTotalTimeMicroseconds :: Int64
   }
 
 -- | Record a poll in the per-operation metrics of the operations the poller serves. These are
@@ -626,11 +638,14 @@ recordPollByOperation PrometheusMetrics {pmSubscriptionMetrics = SubscriptionMet
     when (pboFailedBatches > 0) $ CounterVector.add submPollErrorsByOperation label (fromIntegral pboFailedBatches)
     CounterVector.add submCohortsProcessedByOperation label (fromIntegral pboCohorts)
   -- Amounts, unlike events, are split so that the operations' parts add up to the poll's.
-  let addSplit vector changed amount =
+  let addSplit :: (Ord l) => CounterVector l -> (SubscriptionLabel -> l) -> Int64 -> IO ()
+      addSplit vector toLabel amount =
         for_ (splitBySubscribers amount operations) \(operation, part) ->
-          when (part > 0) $ CounterVector.add vector (SubscriptionChangedLabel (SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation))) changed) (fromIntegral part)
-  addSplit submResultBytes True pboChangedResultBytes
-  addSplit submResultBytes False pboUnchangedResultBytes
+          when (part > 0) $ CounterVector.add vector (toLabel (SubscriptionLabel kind (Just (DynamicGraphqlOperationLabel operation)))) (fromIntegral part)
+  addSplit submResultBytes (`SubscriptionChangedLabel` True) pboChangedResultBytes
+  addSplit submResultBytes (`SubscriptionChangedLabel` False) pboUnchangedResultBytes
+  addSplit submDBExecutionMicroseconds id pboDBExecutionMicroseconds
+  addSplit submTotalTimeMicroseconds id pboTotalTimeMicroseconds
   -- The gauge gets only the difference from what this poller added at its last poll: an
   -- operation the poller no longer serves drops its share. A poll that ends after its poller was
   -- removed (and so forgotten) changes nothing.
@@ -664,6 +679,10 @@ addCohortResultBytes resultBytes changed size =
     let !changedBytes' = if changed then changedBytes + fromIntegral size else changedBytes
         !unchangedBytes' = if changed then unchangedBytes else unchangedBytes + fromIntegral size
      in ((changedBytes', unchangedBytes'), ())
+
+-- | A time in whole microseconds (truncated).
+wholeMicroseconds :: DiffTime -> Int64
+wholeMicroseconds time = fromIntegral (diffTimeToPicoseconds time `div` 1000000)
 
 -- | Splits an amount among operations in proportion to their subscribers, by integer division.
 -- The remainder goes to the operation with the most subscribers (the greatest label among
@@ -1058,6 +1077,18 @@ data PrometheusMetricsSpec :: Symbol -> Symbol -> MetricType -> Type -> Type whe
       "Total number of bytes of subscription results returned by the database"
       'CounterType
       SubscriptionChangedLabel
+  SubscriptionDBExecutionSecondsTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_db_execution_seconds_total"
+      "Total time spent executing subscription queries in the database, excluding the pool wait, in seconds"
+      'CounterType
+      SubscriptionLabel
+  SubscriptionTotalTimeSecondsTotal ::
+    PrometheusMetricsSpec
+      "hasura_subscription_total_time_seconds_total"
+      "Total time spent in subscription poll cycles, in seconds"
+      'CounterType
+      SubscriptionLabel
   ActiveSubscriptionPollersByOperation ::
     PrometheusMetricsSpec
       "hasura_active_subscription_pollers_by_operation"
@@ -1305,6 +1336,10 @@ makeSubscriptionMetrics store = do
   submSubscribersServed <- createCounterVector SubscriptionSubscribersServedTotal store OrdMap.toList
   submSentBytes <- createCounterVector SubscriptionSentBytesTotal store OrdMap.toList
   submResultBytes <- createCounterVector SubscriptionResultBytesTotal store OrdMap.toList
+  -- Kept in microseconds so that the parts add up exactly; exported in seconds.
+  let microsecondsToSeconds = map (fmap (/ 1000000)) . OrdMap.toList
+  submDBExecutionMicroseconds <- createCounterVector SubscriptionDBExecutionSecondsTotal store microsecondsToSeconds
+  submTotalTimeMicroseconds <- createCounterVector SubscriptionTotalTimeSecondsTotal store microsecondsToSeconds
   pure SubscriptionMetrics {..}
 
 -- Histogram buckets of the exported metric families (see BBB-CHANGES.md).

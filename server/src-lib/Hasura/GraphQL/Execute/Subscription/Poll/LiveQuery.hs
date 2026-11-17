@@ -45,7 +45,7 @@ import Hasura.RQL.Types.BackendType (BackendType (..), PostgresKind (Vanilla))
 import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation, recordPushByOperation)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, liveQuerySubscriptionLabel, pollOperationLabels, recordPollByOperation, recordPushByOperation, wholeMicroseconds)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Refined (unrefine)
 import System.Metrics.Prometheus.Gauge qualified as Prometheus.Gauge
@@ -228,7 +228,9 @@ pollLiveQuery pollerId pollerResponseState lqOpts (sourceName, sourceConfig) rol
         pboFailedBatches = length (catMaybes maybeErrors),
         pboCohorts = sum (map (length . _bedCohorts) batchesDetails),
         pboChangedResultBytes = changedResultBytes,
-        pboUnchangedResultBytes = unchangedResultBytes
+        pboUnchangedResultBytes = unchangedResultBytes,
+        pboDBExecutionMicroseconds = sum (map (wholeMicroseconds . _bedDbExecutionTime) batchesDetails),
+        pboTotalTimeMicroseconds = wholeMicroseconds totalTime
       }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   modelInfoLogStatus' <- modelInfoLogStatus

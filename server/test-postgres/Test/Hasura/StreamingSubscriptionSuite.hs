@@ -57,7 +57,7 @@ import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ResizePool (ResizePoolStrategy (..))
 import Hasura.Server.Init (considerEnv, databaseUrlOption, runWithEnv, _envVar)
 import Hasura.Server.Metrics (createServerMetrics)
-import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionChangedLabel (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, registerPollerByOperation, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (DynamicGraphqlOperationLabel (..), OperationNameLabel (..), PrometheusMetrics (..), SubscriptionChangedLabel (..), SubscriptionLabel (..), SubscriptionMetrics (..), liveQuerySubscriptionLabel, makeDummyPrometheusMetrics, registerPollerByOperation, splitBySubscribers, streamingSubscriptionLabel, wholeMicroseconds)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (ModelInfoLogOff), RequestId (..))
 import Language.GraphQL.Draft.Syntax (unsafeMkName)
 import Language.GraphQL.Draft.Syntax.QQ qualified as G
@@ -801,6 +801,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
             poller <- maybe (error "no poller") pure . listToMaybe =<< pollers
             ioState <- STM.atomically (STM.readTMVar (_pIOState poller))
             Immortal.stop (_pThread ioState)
+            pollDetails <- newIORef []
             let poll duringPoll =
                   pollStreamingQuery
                     @('Postgres 'Vanilla)
@@ -813,7 +814,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                     (MultiplexedQuery multiplexedQuery)
                     (_pCohorts poller)
                     [G.name|numbers_stream|]
-                    (const $ pure ())
+                    (\details -> atomicModifyIORef' pollDetails (\ds -> (ds <> [details], ())))
                     duringPoll
                     promMetrics
                     (pure GranularMetricsOff)
@@ -825,7 +826,7 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
                     (pure ModelInfoLogOff)
                 stopAll = pollers >>= traverse_ \p -> STM.atomically (STM.tryReadTMVar (_pIOState p)) >>= traverse_ (Immortal.stop . _pThread)
             atomicModifyIORef' received (\_ -> ([], ()))
-            pure OpScenario {osJoin = joinNamed, osLeave = leaveNamed, osSentinel = sentinel, osPoll = poll, osMetrics = promMetrics, osReceived = readIORef received, osStop = stopAll}
+            pure OpScenario {osJoin = joinNamed, osLeave = leaveNamed, osSentinel = sentinel, osPoll = poll, osMetrics = promMetrics, osReceived = readIORef received, osPollDetails = readIORef pollDetails, osStop = stopAll}
           op = Just . OperationName . unsafeMkName
           -- The value of a per-operation series of the streaming kind.
           byOperation :: CounterVector.CounterVector SubscriptionLabel -> Text -> IO Double
@@ -961,6 +962,33 @@ streamingSubscriptionPollingSpec srcConfig timeoutPool = do
           -- 23 bytes: 11, 5 and 5, and the remaining 2 to First.
           emptyResult `shouldBe` 23
           unchangedBytes `shouldBe` [("First", 13), ("Second", 5), ("Sentinel", 5)]
+
+      describe "database execution and poll time" $ do
+        -- Operations with 2 (First), 1 (Second) and 1 (Sentinel) subscribers; two polls.
+        (dbTime, totalTime, details) <- runIO do
+          OpScenario {..} <- newOpScenario
+          _ <- osJoin (op "First") "a" 1
+          _ <- osJoin (op "First") "b" 2
+          _ <- osJoin (op "Second") "c" 1
+          osPoll Nothing
+          osPoll Nothing
+          let SubscriptionMetrics {..} = pmSubscriptionMetrics osMetrics
+              byName vector = sort . map (first (\(SubscriptionLabel _ dl) -> maybe "" (\(DynamicGraphqlOperationLabel (OperationNameLabel name)) -> name) dl)) . Map.toList <$> CounterVector.read vector
+          result <- (,,) <$> byName submDBExecutionMicroseconds <*> byName submTotalTimeMicroseconds <*> osPollDetails
+          osStop
+          pure result
+        let operations = HashMap.fromList [(OperationNameLabel "First", 2), (OperationNameLabel "Second", 1), (OperationNameLabel "Sentinel", 1)]
+            -- What each poll's hook reported, split poll by poll, added up by operation.
+            expectedFrom pollTime = sort . Map.toList . Map.fromListWith (+) $ [(unOperationNameLabel name, fromIntegral part) | poll <- details, (name, part) <- splitBySubscribers (pollTime poll) operations]
+            dbOf poll = sum [wholeMicroseconds (_bedDbExecutionTime batch) | batch <- _pdBatches poll]
+            totalOf = wholeMicroseconds . _pdTotalTime
+        it "the database time of the polls is split among the operations, in whole microseconds" $ do
+          length details `shouldBe` 2
+          sum (map snd dbTime) `shouldBe` fromIntegral (sum (map dbOf details))
+          dbTime `shouldBe` expectedFrom dbOf
+        it "the time of the polls is split among the operations, in whole microseconds" $ do
+          sum (map snd totalTime) `shouldBe` fromIntegral (sum (map totalOf details))
+          totalTime `shouldBe` expectedFrom totalOf
 
       describe "a live query poll" $ do
         -- Two subscribers of LiveOp in one cohort of a live query poller, whose thread is stopped,
@@ -1150,6 +1178,8 @@ data OpScenario = OpScenario
     -- | The subscriber that keeps the poller alive, of the operation @Sentinel@.
     osSentinel :: SubscriberDetails,
     osPoll :: Maybe (IO ()) -> IO (),
+    -- | What the poller's post-poll hook received, poll by poll.
+    osPollDetails :: IO [PollDetails],
     osMetrics :: PrometheusMetrics,
     osReceived :: IO [(Text, Int)],
     osStop :: IO ()

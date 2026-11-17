@@ -56,7 +56,7 @@ cohortsGaugeSpec = describe "the active cohorts by operation" $ do
   it "counts a registered poller's cohorts, takes them out on removal and ignores a later poll" $ do
     metrics <- makeDummyPrometheusMetrics
     let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f01")
-        report = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 3 0 0)
+        report = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 3 0 0 0 0)
         gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
     report
     unregistered <- gauge
@@ -72,7 +72,7 @@ cohortsGaugeSpec = describe "the active cohorts by operation" $ do
   it "leaves the gauge as it is on a repeated report, and moves it on a changed one" $ do
     metrics <- makeDummyPrometheusMetrics
     let pollerId = fromMaybe (error "uuid") (UUID.fromString "0b6f1c1e-2a8f-4a0e-9a41-6c9b1d6a7f02")
-        report cohorts = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 cohorts 0 0)
+        report cohorts = recordPollByOperation metrics streamingSubscriptionLabel (HashMap.singleton (OperationNameLabel "getUsers") 1) (PollByOperation pollerId 0 cohorts 0 0 0 0)
         gauge = OrdMap.elems <$> GaugeVector.read (submActiveCohortsByOperation (pmSubscriptionMetrics metrics))
     registerPollerByOperation metrics pollerId
     report 3
@@ -315,6 +315,18 @@ operationNameSeriesSpec = describe "operation_name series" $ do
     rendered <- renderSample metrics
     sort [line | line <- T.lines rendered, "hasura_websocket_messages_sent_bytes_total" `T.isPrefixOf` line, not ("#" `T.isPrefixOf` line)]
       `shouldBe` ["hasura_websocket_messages_sent_bytes_total 30.0", "hasura_websocket_messages_sent_bytes_total{operation_name=\"getUsers\"} 120.0"]
+  it "export the per-operation times, kept in microseconds, in seconds" $ do
+    store <- Prometheus.newStore @PrometheusMetricsSpec
+    metrics <- makePrometheusMetrics store
+    let subm = pmSubscriptionMetrics metrics
+    label <- subscriptionLabel metrics streamingSubscriptionLabel (Just (OperationName [G.name|getUsers|]))
+    CounterVector.add (submDBExecutionMicroseconds subm) label 1500000
+    CounterVector.add (submTotalTimeMicroseconds subm) label 250
+    rendered <- renderSample metrics
+    let seriesOf family = [line | line <- T.lines rendered, (family <> "{") `T.isPrefixOf` line]
+    seriesOf "hasura_subscription_db_execution_seconds_total" `shouldBe` ["hasura_subscription_db_execution_seconds_total{operation_name=\"getUsers\",subscription_kind=\"streaming\"} 1.5"]
+    seriesOf "hasura_subscription_total_time_seconds_total" `shouldBe` ["hasura_subscription_total_time_seconds_total{operation_name=\"getUsers\",subscription_kind=\"streaming\"} 2.5e-4"]
+
 makePrometheusMetricsSpec :: Spec
 makePrometheusMetricsSpec = describe "makePrometheusMetrics" $ do
   it "registers every metric and exports the expected # TYPE lines" $ do
@@ -366,6 +378,8 @@ observeEveryVectorOnce metrics = do
   CounterVector.inc (submSubscribersServed subm) (SubscriptionChangedLabel subLabel True)
   CounterVector.inc (submSentBytes subm) (SubscriptionChangedLabel subLabel True)
   CounterVector.inc (submResultBytes subm) (SubscriptionChangedLabel subLabel True)
+  CounterVector.inc (submDBExecutionMicroseconds subm) subLabel
+  CounterVector.inc (submTotalTimeMicroseconds subm) subLabel
   CounterVector.inc (pmWebSocketBytesSent metrics) Nothing
   let pool = pmPostgresPoolMetrics metrics
   HistogramVector.observe (ppmWaitTime pool) metadataPoolLabel 0.1
@@ -429,6 +443,8 @@ expectedTypeLines =
       "# TYPE hasura_subscription_subscribers_served_total counter",
       "# TYPE hasura_subscription_sent_bytes_total counter",
       "# TYPE hasura_subscription_result_bytes_total counter",
+      "# TYPE hasura_subscription_db_execution_seconds_total counter",
+      "# TYPE hasura_subscription_total_time_seconds_total counter",
       "# TYPE hasura_websocket_connections gauge",
       "# TYPE hasura_websocket_message_queue_time histogram",
       "# TYPE hasura_websocket_message_write_time histogram",

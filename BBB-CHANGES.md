@@ -316,6 +316,13 @@ always on.
     remainder to the operation with the most subscribers, the greatest label among equals), and
     the operations' parts add up to the poll's bytes. `changed="false"` here is the poll's
     waste: results the database returned that went to no one but new subscribers.
+  - `hasura_subscription_db_execution_seconds_total` (the database execution time of the
+    poll's batches, added up, without the pool wait) and
+    `hasura_subscription_total_time_seconds_total` (the poll's time) are split the same way.
+    They are kept in whole microseconds (each batch's time and each poll's time truncated), so
+    the operations' parts add up exactly, and are converted to seconds when exported (the
+    transformation argument of `createCounterVector`; the embedded `ekg-prometheus` is
+    unchanged).
 
 ## Formatting
 

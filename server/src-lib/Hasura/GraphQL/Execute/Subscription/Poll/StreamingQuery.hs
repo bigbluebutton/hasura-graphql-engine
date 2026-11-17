@@ -46,7 +46,7 @@ import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.SQL.Value (TxtEncodedVal (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, pollOperationLabels, recordPollByOperation, recordPushByOperation, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, pollOperationLabels, recordPollByOperation, recordPushByOperation, streamingSubscriptionLabel, wholeMicroseconds)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Refined (unrefine)
@@ -493,7 +493,9 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
         pboFailedBatches = length (catMaybes maybeErrors),
         pboCohorts = sum (map (length . _bedCohorts) batchesDetails),
         pboChangedResultBytes = changedResultBytes,
-        pboUnchangedResultBytes = unchangedResultBytes
+        pboUnchangedResultBytes = unchangedResultBytes,
+        pboDBExecutionMicroseconds = sum (map (wholeMicroseconds . _bedDbExecutionTime) batchesDetails),
+        pboTotalTimeMicroseconds = wholeMicroseconds totalTime
       }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
   liftIO $ HistogramVector.observe totalTimeMetric streamingSubscriptionLabel (realToFrac totalTime)
