@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret option (HASURA_GRAPHQL_METRICS_SECRET). See BBB-CHANGES.md.
+-- adds the metrics secret option (HASURA_GRAPHQL_METRICS_SECRET) and the metrics operation name
+-- limit option (HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT). See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-deprecations #-}
 
@@ -89,6 +90,7 @@ module Hasura.Server.Init.Arg.Command.Serve
     enableRelayOption,
     remoteSchemaHealingIntervalOption,
     metricsSecretOption,
+    metricsOperationNameLimitOption,
 
     -- * Pretty Printer
     serveCmdFooter,
@@ -203,6 +205,7 @@ serveCommandParser =
     <*> parseEnableRelay
     <*> parseRemoteSchemaHealingInterval
     <*> parseMetricsSecret
+    <*> parseMetricsOperationNameLimit
 
 --------------------------------------------------------------------------------
 -- Serve Options
@@ -1774,7 +1777,8 @@ serveCmdFooter =
         Config.optionPP logMaskedVariablesOption,
         Config.optionPP enableRelayOption,
         Config.optionPP remoteSchemaHealingIntervalOption,
-        Config.optionPP metricsSecretOption
+        Config.optionPP metricsSecretOption,
+        Config.optionPP metricsOperationNameLimitOption
       ]
     eventEnvs = [Config.optionPP graphqlEventsHttpPoolSizeOption, Config.optionPP graphqlEventsFetchIntervalOption]
 
@@ -1793,5 +1797,23 @@ metricsSecretOption =
   Config.Option
     { Config._default = (),
       Config._envVar = "HASURA_GRAPHQL_METRICS_SECRET",
-      Config._helpMessage = "Secret key for the metrics endpoint, sent as \"Authorization: Bearer <secret>\" (if not set, the metrics endpoint rejects every request with 401)"
+      Config._helpMessage = "Secret key for the metrics endpoint, sent as \"Authorization: Bearer <secret>\" (if not set or empty, the metrics endpoint rejects every request with 401)"
+    }
+
+parseMetricsOperationNameLimit :: Opt.Parser (Maybe (Refined Positive Int))
+parseMetricsOperationNameLimit =
+  Opt.optional
+    $ Opt.option
+      (Opt.eitherReader Env.fromEnv)
+      ( Opt.long "metrics-operation-name-limit"
+          <> Opt.metavar (Config._envVar metricsOperationNameLimitOption)
+          <> Opt.help (Config._helpMessage metricsOperationNameLimitOption)
+      )
+
+metricsOperationNameLimitOption :: Config.Option (Refined Positive Int)
+metricsOperationNameLimitOption =
+  Config.Option
+    { Config._default = $$(refineTH @Positive @Int 500),
+      Config._envVar = "HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT",
+      Config._helpMessage = "Max number of distinct operation names that become values of the operation_name label of the metrics; any other name is labeled (other). Read at start (default: 500; minimum: 1). bbb-graphql-middleware has the same cap, prometheus_operation_name_limit: if you change this, you probably also want to change it, so that the counts by name stay comparable. The option has no maximum: the memory held until a restart and the time and size of a scrape grow in proportion to the names admitted (with 10,000 names a scrape took about 2 s on a release build, against the default Prometheus scrape timeout of 10 s)"
     }

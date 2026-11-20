@@ -1,3 +1,7 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- observes the poll time histograms by subscription kind only and records the per-operation
+-- subscription metrics; does not observe the database time of a poll batch that ran no query.
+-- See BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
@@ -14,6 +18,7 @@ import Data.Aeson.Ordered qualified as JO
 import Data.ByteString qualified as BS
 import Data.HashMap.Strict.Extended qualified as HashMap
 import Data.HashSet qualified as Set
+import Data.IORef (newIORef, readIORef)
 import Data.List.Split (chunksOf)
 import Data.Monoid (Endo (..), Sum (..))
 import Data.Text.Extended
@@ -41,7 +46,7 @@ import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Subscription (SubscriptionType (..))
 import Hasura.SQL.Value (TxtEncodedVal (..))
 import Hasura.Server.Logging (ModelInfo (..), ModelInfoLog (..))
-import Hasura.Server.Prometheus (PrometheusMetrics (..), SubscriptionMetrics (..), recordSubscriptionMetric, streamingSubscriptionLabel)
+import Hasura.Server.Prometheus (PollByOperation (..), PrometheusMetrics (..), SubscriptionMetrics (..), addCohortResultBytes, pollOperationLabels, recordPollByOperation, recordPushByOperation, streamingSubscriptionLabel, wholeMicroseconds)
 import Hasura.Server.Types (GranularPrometheusMetricsState (..), ModelInfoLogState (..))
 import Language.GraphQL.Draft.Syntax qualified as G
 import Refined (unrefine)
@@ -177,6 +182,7 @@ mergeOldAndNewCursorValues (CursorVariableValues prevPollCursorValues) (CursorVa
    in CursorVariableValues $ HashMap.unionWith combineFn prevPollCursorValues currentPollCursorValues
 
 pushResultToCohort ::
+  PrometheusMetrics ->
   GQResult BS.ByteString ->
   Maybe ResponseHash ->
   SubscriptionMetadata ->
@@ -188,16 +194,18 @@ pushResultToCohort ::
   CursorVariableValues ->
   -- | Root field name
   G.Name ->
-  -- | subscribers to which data has been pushed, subscribers which already
-  -- have this data (this information is exposed by metrics reporting)
   (CohortSnapshot 'Streaming, Cohort 'Streaming) ->
-  IO ([SubscriberExecutionDetails], [SubscriberExecutionDetails])
-pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cursorValues prevCursorValues rootFieldName (cohortSnapshot, cohort) = do
+  -- | whether the result changed since the previous poll; subscribers to which data has been
+  -- pushed, subscribers which already have this data (this information is exposed by metrics
+  -- reporting)
+  IO (Bool, ([SubscriberExecutionDetails], [SubscriberExecutionDetails]))
+pushResultToCohort prometheusMetrics result !respHashM (SubscriptionMetadata dTime) cursorValues prevCursorValues rootFieldName (cohortSnapshot, cohort) = do
   prevRespHashM <- STM.readTVarIO respRef
+  let changed = isExecError result || respHashM /= prevRespHashM
   -- write to the current websockets if needed
   (subscribersToPush, subscribersToIgnore) <-
     -- We send the response to all the subscribers only when the response changes.
-    if isExecError result || respHashM /= prevRespHashM
+    if changed
       then do
         $assertNFHere respHashM -- so we don't write thunks to mutable vars
         STM.atomically $ do
@@ -207,7 +215,11 @@ pushResultToCohort result !respHashM (SubscriptionMetadata dTime) cursorValues p
       else -- when the response is unchanged, the response is only sent to the newly added subscribers
         return (newSinks, curSinks)
   pushResultToSubscribers subscribersToPush
+  -- An empty response is not pushed, so it serves no one.
+  unless isResponseEmpty
+    $ recordPushByOperation prometheusMetrics streamingSubscriptionLabel changed (either (const 0) BS.length result) (map _sOperationName subscribersToPush)
   pure
+    $ (changed,)
     $ over
       (each . each)
       ( \Subscriber {..} ->
@@ -268,8 +280,9 @@ pollStreamingQuery ::
   [ModelInfoPart] ->
   IO ModelInfoLogState ->
   IO ()
-pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, sourceConfig) roleName parameterizedQueryHash query cohortMap rootFieldName postPollHook testActionMaybe prometheusMetrics granularPrometheusMetricsState operationNames' resolvedConnectionTemplate modifier logger modelInfoList modelInfoLogStatus = do
+pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, sourceConfig) roleName parameterizedQueryHash query cohortMap rootFieldName postPollHook testActionMaybe prometheusMetrics _granularPrometheusMetricsState operationNames' resolvedConnectionTemplate modifier logger modelInfoList modelInfoLogStatus = do
   operationNames <- STM.atomically $ TMap.getMap operationNames'
+  resultBytes <- newIORef (0, 0)
   (totalTime, (snapshotTime, (batchesDetails, processedCohorts, maybeErrors))) <- withElapsedTime $ do
     -- snapshot the current cohorts and split them into batches
     -- This STM transaction is a read only transaction i.e. it doesn't mutate any state
@@ -287,20 +300,17 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
 
     -- concurrently process each batch and also get the processed cohort with the new updated cohort key
     batchesDetailsAndProcessedCohortsWithMaybeError <- A.forConcurrently cohortBatches $ \(batchId, cohorts) -> do
-      (queryExecutionTime, mxRes) <-
+      (maybeQueryExecutionTime, mxRes) <-
         runDBStreamingSubscription @b
           sourceConfig
           query
           (over (each . _2) C._csVariables $ fmap (fmap fst) cohorts)
           resolvedConnectionTemplate
       let dbExecTimeMetric = submDBExecTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
-      recordSubscriptionMetric
-        granularPrometheusMetricsState
-        True
-        operationNames
-        parameterizedQueryHash
-        streamingSubscriptionLabel
-        (flip (HistogramVector.observe dbExecTimeMetric) (realToFrac queryExecutionTime))
+      -- A batch that got no pool connection ran no query, and has no database time to observe.
+      for_ maybeQueryExecutionTime \queryExecutionTime' ->
+        liftIO $ HistogramVector.observe dbExecTimeMetric streamingSubscriptionLabel (realToFrac queryExecutionTime')
+      let queryExecutionTime = fromMaybe 0 maybeQueryExecutionTime
 
       previousPollerResponseState <- STM.readTVarIO pollerResponseState
 
@@ -336,9 +346,10 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
                 case latestCursorValueMaybe of
                   Nothing -> prevCursorVariableValue -- Nothing indicates there was an error when the query was polled
                   Just currentPollCursorValue -> mergeOldAndNewCursorValues prevCursorVariableValue currentPollCursorValue
-          (pushedSubscribers, ignoredSubscribers) <-
+          (changed, (pushedSubscribers, ignoredSubscribers)) <-
             -- Push the result to the subscribers present in the cohorts
-            pushResultToCohort res (fst <$> respData) subscriptionMeta latestCursorValue prevCursorVariableValue rootFieldName (snapshot, cohort)
+            pushResultToCohort prometheusMetrics res (fst <$> respData) subscriptionMeta latestCursorValue prevCursorVariableValue rootFieldName (snapshot, cohort)
+          for_ respData $ addCohortResultBytes resultBytes changed . snd
           let currentCohortKey = C._csVariables snapshot
               updatedCohortKey = modifyCursorCohortVariables (mkUnsafeValidateVariables updatedCursorVarVal) $ C._csVariables snapshot
               snapshottedNewSubs = C._csNewSubscribers snapshot
@@ -474,14 +485,20 @@ pollStreamingQuery pollerId pollerResponseState streamingQueryOpts (sourceName, 
     for_ (modelInfoList) $ \(ModelInfoPart modelName modelType modelSourceName modelSourceType modelQueryType) -> do
       unLogger logger $ ModelInfoLog LevelInfo $ ModelInfo modelName (toTxt modelType) (toTxt <$> modelSourceName) (toTxt <$> modelSourceType) (toTxt modelQueryType) False
   postPollHook pollDetails
+  operationLabels <- pollOperationLabels prometheusMetrics operationNames
+  (changedResultBytes, unchangedResultBytes) <- readIORef resultBytes
+  recordPollByOperation prometheusMetrics streamingSubscriptionLabel operationLabels
+    $ PollByOperation
+      { pboPollerId = unPollerId pollerId,
+        pboFailedBatches = length (catMaybes maybeErrors),
+        pboCohorts = sum (map (length . _bedCohorts) batchesDetails),
+        pboChangedResultBytes = changedResultBytes,
+        pboUnchangedResultBytes = unchangedResultBytes,
+        pboDBExecutionMicroseconds = sum (map (wholeMicroseconds . _bedDbExecutionTime) batchesDetails),
+        pboTotalTimeMicroseconds = wholeMicroseconds totalTime
+      }
   let totalTimeMetric = submTotalTime $ pmSubscriptionMetrics $ prometheusMetrics
-  recordSubscriptionMetric
-    granularPrometheusMetricsState
-    True
-    operationNames
-    parameterizedQueryHash
-    streamingSubscriptionLabel
-    (flip (HistogramVector.observe totalTimeMetric) (realToFrac totalTime))
+  liftIO $ HistogramVector.observe totalTimeMetric streamingSubscriptionLabel (realToFrac totalTime)
   where
     SubscriptionsOptions batchSize _ = streamingQueryOpts
 

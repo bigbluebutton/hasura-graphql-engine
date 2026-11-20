@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- tests the metrics operation name limit argument. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -1467,6 +1469,32 @@ serveParserSpec =
           parserInfo = Opt.info (UUT.serveCommandParser @Logging.Hasura Opt.<**> Opt.helper) Opt.fullDesc
           -- When
           argInput = ["--events-http-pool-size", "10.5"]
+          -- Then
+          result = Opt.execParserPure Opt.defaultPrefs parserInfo argInput
+
+      case result of
+        Opt.Success _result -> Hspec.expectationFailure "Should not parse successfully"
+        Opt.Failure _pf -> pure ()
+        Opt.CompletionInvoked cr -> Hspec.expectationFailure $ show cr
+
+    Hspec.it "It accepts '--metrics-operation-name-limit'" $ do
+      let -- Given
+          parserInfo = Opt.info (UUT.serveCommandParser @Logging.Hasura Opt.<**> Opt.helper) Opt.fullDesc
+          -- When
+          argInput = ["--metrics-operation-name-limit", "10000"]
+          -- Then
+          result = Opt.execParserPure Opt.defaultPrefs parserInfo argInput
+
+      fmap UUT.rsoMetricsOperationNameLimit result `Hspec.shouldSatisfy` \case
+        Opt.Success limit -> limit == Just $$(refineTH @Positive @Int 10000)
+        Opt.Failure _pf -> False
+        Opt.CompletionInvoked _cr -> False
+
+    Hspec.it "It fails '--metrics-operation-name-limit' expects a positive integer" $ do
+      let -- Given
+          parserInfo = Opt.info (UUT.serveCommandParser @Logging.Hasura Opt.<**> Opt.helper) Opt.fullDesc
+          -- When
+          argInput = ["--metrics-operation-name-limit", "0"]
           -- Then
           result = Opt.execParserPure Opt.defaultPrefs parserInfo argInput
 

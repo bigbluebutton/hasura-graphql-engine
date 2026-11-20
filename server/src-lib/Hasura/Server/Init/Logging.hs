@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- logs the metrics operation name limit with the serve options. See BBB-CHANGES.md.
+
 -- | Helpful functions and types for generating log statements and URIs during
 -- Options fetching and merging.
 module Hasura.Server.Init.Logging
@@ -122,6 +125,7 @@ serveOptsToLog so =
           "graceful_shutdown_timeout" .= Config.soGracefulShutdownTimeout so,
           "websocket_connection_init_timeout" .= show (Config.soWebSocketConnectionInitTimeout so),
           "websocket_queue_size" .= Config.soWebSocketQueueSize so,
+          "metrics_operation_name_limit" .= Config.soMetricsOperationNameLimit so,
           "enable_metadata_query_logging" .= Config.soEnableMetadataQueryLogging so,
           "http_log_query_only_on_error" .= Config.soHttpLogQueryOnlyOnError so
         ]

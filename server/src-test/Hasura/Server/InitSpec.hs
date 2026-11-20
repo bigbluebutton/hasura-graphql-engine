@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret to the raw serve options. See BBB-CHANGES.md.
+-- adds the metrics secret to the raw serve options and tests that an empty one counts as
+-- not set; adds and tests the metrics operation name limit. See BBB-CHANGES.md.
 {-# LANGUAGE TemplateHaskell #-}
 
 module Hasura.Server.InitSpec
@@ -120,7 +121,8 @@ emptyServeOptionsRaw =
       rsoLogMaskedVariables = Nothing,
       rsoRelayMode = UUT.RelayModeEnabled,
       rsoRemoteSchemaHealingInterval = Nothing,
-      rsoMetricsSecret = Nothing
+      rsoMetricsSecret = Nothing,
+      rsoMetricsOperationNameLimit = Nothing
     }
 
 mkServeOptionsSpec :: Hspec.Spec
@@ -328,6 +330,40 @@ mkServeOptionsSpec =
             result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura rawServeOptions)
 
         fmap UUT.soAdminSecret result `Hspec.shouldBe` Right (Set.singleton (Auth.hashAdminSecret "Whats the big deal"))
+
+    Hspec.describe "soMetricsSecret" $ do
+      Hspec.it "Env > Nothing" $ do
+        let env = [(UUT._envVar UUT.metricsSecretOption, "metrics secret")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right (Just (Auth.hashAdminSecret "metrics secret"))
+
+      Hspec.it "an empty secret counts as not set" $ do
+        let env = [(UUT._envVar UUT.metricsSecretOption, "")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap UUT.soMetricsSecret result `Hspec.shouldBe` Right Nothing
+
+    Hspec.describe "soMetricsOperationNameLimit" $ do
+      Hspec.it "Default == 500" $ do
+        let result = UUT.runWithEnv [] (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap (unrefine . UUT.soMetricsOperationNameLimit) result `Hspec.shouldBe` Right 500
+
+      Hspec.it "Env > Default" $ do
+        let env = [(UUT._envVar UUT.metricsOperationNameLimitOption, "10000")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+        fmap (unrefine . UUT.soMetricsOperationNameLimit) result `Hspec.shouldBe` Right 10000
+
+      Hspec.it "Arg > Env" $ do
+        let rawServeOptions = emptyServeOptionsRaw {UUT.rsoMetricsOperationNameLimit = Just $$(refineTH @Positive @Int 5)}
+            env = [(UUT._envVar UUT.metricsOperationNameLimitOption, "10000")]
+            result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura rawServeOptions)
+        fmap (unrefine . UUT.soMetricsOperationNameLimit) result `Hspec.shouldBe` Right 5
+
+      Hspec.it "refuses a value that is zero, negative or not a number" $ do
+        for_ ["0", "-1", "many"] \value -> do
+          let env = [(UUT._envVar UUT.metricsOperationNameLimitOption, value)]
+              result = UUT.runWithEnv env (UUT.mkServeOptions @Hasura emptyServeOptionsRaw)
+          fmap (unrefine . UUT.soMetricsOperationNameLimit) result
+            `Hspec.shouldBe` Left "Fatal Error:- Environment variable HASURA_GRAPHQL_METRICS_OPERATION_NAME_LIMIT: Only expecting a positive integer"
 
     Hspec.describe "soAuthHook" $ do
       Hspec.it "Default Hook Mode == GET" $ do

@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- subscription queries are timed inside the transaction, so their database execution time
+-- leaves out the wait for a pool connection. See BBB-CHANGES.md.
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
@@ -7,13 +10,16 @@
 -- database for running queries, mutations, subscriptions, and so on.
 module Hasura.Backends.Postgres.Instances.Transport
   ( runPGMutationTransaction,
+    withQueryExecutionTime,
   )
 where
 
+import Control.Exception.Lifted (finally)
 import Control.Monad.Trans.Control
 import Data.Aeson qualified as J
 import Data.ByteString qualified as B
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text.Extended
 import Database.PG.Query qualified as PG
 import Hasura.Authentication.User (UserInfo)
@@ -125,12 +131,13 @@ runPGSubscription ::
   MultiplexedQuery ('Postgres pgKind) ->
   [(CohortId, CohortVariables)] ->
   ResolvedConnectionTemplate ('Postgres pgKind) ->
-  m (DiffTime, Either QErr [(CohortId, B.ByteString)])
+  m (Maybe DiffTime, Either QErr [(CohortId, B.ByteString)])
 runPGSubscription sourceConfig query variables resolvedConnectionTemplate =
-  withElapsedTime
-    $ runExceptT
-    $ runQueryTx (_pscExecCtx sourceConfig) (GraphQLQuery resolvedConnectionTemplate)
-    $ PGL.executeMultiplexedQuery query variables
+  withQueryExecutionTime \timeQuery ->
+    runExceptT
+      $ runQueryTx (_pscExecCtx sourceConfig) (GraphQLQuery resolvedConnectionTemplate)
+      $ timeQuery
+      $ PGL.executeMultiplexedQuery query variables
 
 runPGStreamingSubscription ::
   (MonadIO m, MonadBaseControl IO m) =>
@@ -138,13 +145,33 @@ runPGStreamingSubscription ::
   MultiplexedQuery ('Postgres pgKind) ->
   [(CohortId, CohortVariables)] ->
   ResolvedConnectionTemplate ('Postgres pgKind) ->
-  m (DiffTime, Either QErr [(CohortId, B.ByteString, CursorVariableValues)])
+  m (Maybe DiffTime, Either QErr [(CohortId, B.ByteString, CursorVariableValues)])
 runPGStreamingSubscription sourceConfig query variables resolvedConnectionTemplate =
-  withElapsedTime
-    $ runExceptT
-    $ do
-      res <- runQueryTx (_pscExecCtx sourceConfig) (GraphQLQuery resolvedConnectionTemplate) $ PGL.executeStreamingMultiplexedQuery query variables
-      pure $ res <&> (\(cohortId, cohortRes, cursorVariableVals) -> (cohortId, cohortRes, PG.getViaJSON cursorVariableVals))
+  withQueryExecutionTime \timeQuery ->
+    runExceptT
+      $ do
+        res <- runQueryTx (_pscExecCtx sourceConfig) (GraphQLQuery resolvedConnectionTemplate) $ timeQuery $ PGL.executeStreamingMultiplexedQuery query variables
+        pure $ res <&> (\(cohortId, cohortRes, cursorVariableVals) -> (cohortId, cohortRes, PG.getViaJSON cursorVariableVals))
+
+-- | Run a subscription query and return the time spent executing it in the
+-- database: the timer is started inside the transaction, so the wait for a pool
+-- connection is left out (the pool measures it). The time is taken however the
+-- query ends: with a result, with a statement error, or with an exception such as
+-- the connection being lost, which is rethrown unchanged. If no connection could
+-- be obtained, the query never starts and no time is returned.
+withQueryExecutionTime ::
+  (MonadIO m) =>
+  ((forall n a. (MonadIO n, MonadBaseControl IO n) => n a -> n a) -> m b) ->
+  m (Maybe DiffTime, b)
+withQueryExecutionTime run = do
+  executionTime <- liftIO $ newIORef Nothing
+  let timeQuery :: (MonadIO n, MonadBaseControl IO n) => n a -> n a
+      timeQuery query = do
+        stopTimer <- startTimer
+        let record = stopTimer >>= liftIO . writeIORef executionTime . Just
+        (query >>= \ !result -> pure result) `finally` record
+  result <- run timeQuery
+  (,result) <$> liftIO (readIORef executionTime)
 
 runPGQueryExplain ::
   forall pgKind m.

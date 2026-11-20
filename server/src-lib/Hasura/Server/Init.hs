@@ -1,5 +1,6 @@
 -- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
--- adds the metrics secret serve option. See BBB-CHANGES.md.
+-- adds the metrics secret serve option, an empty value counting as no secret, and the metrics
+-- operation name limit serve option. See BBB-CHANGES.md.
 {-# LANGUAGE QuasiQuotes #-}
 
 -- | Arg and Env Parsing for initialisation of the engine along with
@@ -249,7 +250,9 @@ mkServeOptions sor@ServeOptionsRaw {..} = do
   soLogMaskedVariables <- withOptionDefault rsoLogMaskedVariables logMaskedVariablesOption
   soRelayMode <- withOptionSwitch' rsoRelayMode (isRelayEnabled, bool RelayModeDisabled RelayModeEnabled) enableRelayOption
   soRemoteSchemaHealingInterval <- withOptionDefault rsoRemoteSchemaHealingInterval remoteSchemaHealingIntervalOption
-  soMetricsSecret <- withOption rsoMetricsSecret metricsSecretOption
+  -- An empty metrics secret counts as no secret, so the endpoint stays closed.
+  soMetricsSecret <- mfilter (/= Auth.hashAdminSecret "") <$> withOption rsoMetricsSecret metricsSecretOption
+  soMetricsOperationNameLimit <- withOptionDefault rsoMetricsOperationNameLimit metricsOperationNameLimitOption
   pure ServeOptions {..}
 
 -- | Fetch Postgres 'Query.ConnParams' components from the environment

@@ -1,3 +1,6 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- follows the subscription method type of BackendTransport, which returns no time for a
+-- query that never started. See BBB-CHANGES.md.
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 -- | MSSQL Instances Transport
@@ -126,7 +129,7 @@ runSubscription ::
   MultiplexedQuery 'MSSQL ->
   [(CohortId, CohortVariables)] ->
   ResolvedConnectionTemplate 'MSSQL ->
-  m (DiffTime, Either QErr [(CohortId, B.ByteString)])
+  m (Maybe DiffTime, Either QErr [(CohortId, B.ByteString)])
 runSubscription sourceConfig (MultiplexedQuery' reselect queryTags) variables _ = do
   let mssqlExecCtx = _mscExecCtx sourceConfig
       multiplexed = multiplexRootReselect variables reselect
@@ -136,7 +139,7 @@ runSubscription sourceConfig (MultiplexedQuery' reselect queryTags) variables _ 
       -- will create a badly formatted query. Hence we use the 'rawUnescapedText' to
       -- append the comment without any escaping.
       queryWithQueryTags = query `withQueryTags` queryTags
-  withElapsedTime $ runExceptT $ executeMultiplexedQuery mssqlExecCtx queryWithQueryTags
+  first Just <$> withElapsedTime (runExceptT $ executeMultiplexedQuery mssqlExecCtx queryWithQueryTags)
 
 executeMultiplexedQuery ::
   (MonadIO m, MonadBaseControl IO m) =>

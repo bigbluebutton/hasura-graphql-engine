@@ -1,7 +1,9 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- tests the version of a test build (scripts/build-v2.sh --dev-version). See BBB-CHANGES.md.
 module Hasura.Server.VersionSpec (spec) where
 
 import Data.Text qualified as T
-import Data.Text.Conversions (FromText (..))
+import Data.Text.Conversions (FromText (..), ToText (..))
 import Hasura.Prelude
 import Hasura.Server.Version
 import Test.Hspec
@@ -34,7 +36,38 @@ versions =
   ]
 
 spec :: Spec
-spec = describe "console assets version" do
+spec = do
+  testBuildVersionSpec
+  consoleAssetsVersionSpec
+
+-- | A test build reports its base version followed by "-dev.g", the first 8 hex digits of the
+-- commit it was built from and, when the tree had uncommitted changes, ".dirty".
+testBuildVersionSpec :: Spec
+testBuildVersionSpec = describe "test build version" do
+  for_ ["v2.50.7-bbb2-dev.g94082f14", "v2.50.7-bbb2-dev.g01234567", "v2.50.7-bbb2-dev.g01234567.dirty"] \devVersion ->
+    it ("is a release version that reads back unchanged: " <> T.unpack devVersion) do
+      case fromText devVersion of
+        VersionRelease _ -> pure ()
+        other -> expectationFailure ("not read as a release version: " <> show other)
+      toText (fromText devVersion :: Version) `shouldBe` devVersion
+  it "needs the g: 8 decimal digits with a leading zero do not read back unchanged" do
+    let undecorated = "v2.50.7-bbb2-dev.01234567" :: Text
+    toText (fromText undecorated :: Version) `shouldNotBe` undecorated
+  it "this binary's version, when it is a test build, ends in -dev.g, 8 hex digits and maybe .dirty" do
+    let version = toText currentVersion
+        (_, devSuffix) = T.breakOn "-dev." version
+        isStamp suffix =
+          let (hash, rest) = T.splitAt 8 (T.drop 6 suffix)
+           in T.take 6 suffix
+                == "-dev.g"
+                && T.length hash
+                == 8
+                && T.all (`elem` ("0123456789abcdef" :: String)) hash
+                && (rest == "" || rest == ".dirty")
+    unless (T.null devSuffix) $ devSuffix `shouldSatisfy` isStamp
+
+consoleAssetsVersionSpec :: Spec
+consoleAssetsVersionSpec = describe "console assets version" do
   parallel
     $ for_ versions \(input, output) ->
       it ("versionToAssetsVersion returns expected output for " <> T.unpack input)

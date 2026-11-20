@@ -1,3 +1,5 @@
+-- Modified by the BigBlueButton project (https://github.com/bigbluebutton/hasura-graphql-engine):
+-- the subscription methods return no time for a query that never started. See BBB-CHANGES.md.
 module Hasura.GraphQL.Transport.Backend
   ( BackendTransport (..),
   )
@@ -73,7 +75,7 @@ class (BackendExecute b) => BackendTransport (b :: BackendType) where
     -- | WARNING: Postgres-specific, ignored by other backends
     [(CohortId, CohortVariables)] ->
     ResolvedConnectionTemplate b ->
-    m (DiffTime, Either QErr [(CohortId, B.ByteString)])
+    m (Maybe DiffTime, Either QErr [(CohortId, B.ByteString)])
   runDBStreamingSubscription ::
     forall m.
     (MonadIO m, MonadBaseControl IO m) =>
@@ -82,7 +84,7 @@ class (BackendExecute b) => BackendTransport (b :: BackendType) where
     -- | WARNING: Postgres-specific, ignored by other backends
     [(CohortId, CohortVariables)] ->
     ResolvedConnectionTemplate b ->
-    m (DiffTime, Either QErr [(CohortId, B.ByteString, CursorVariableValues)])
+    m (Maybe DiffTime, Either QErr [(CohortId, B.ByteString, CursorVariableValues)])
   runDBQueryExplain ::
     forall m.
     ( MonadIO m,
